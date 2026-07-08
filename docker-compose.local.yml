@@ -1,0 +1,92 @@
+services:
+   subgen:
+      container_name: subgen-local
+      tty: true
+      build:
+         context: .
+         dockerfile: Dockerfile
+      image: registry.home.arpa:5000/ngallodev/subgen:local
+      gpus: all
+      environment:
+         DEBUG: "True"
+         LRC_FOR_AUDIO_FILES: "True"
+         WHISPER_MODEL: small
+         WHISPER_THREADS: "4"
+         CLEAR_VRAM_ON_COMPLETE: "True"
+         APPEND: "False"
+         CUSTOM_REGROUP: cm_sl=84_sl=42++++++1
+         CUSTOM_MODEL_PROMPT: ""
+         SUBGEN_KWARGS: >-
+            {'temperature': 0.0, 'no_speech_threshold': 0.95, 'log_prob_threshold': -2.0, 'compression_ratio_threshold': 3.5, 'initial_prompt': 'Transcribe all audible human vocalizations, including speech, laughter, coughing, breathing, sighs, groans, crying, yelling, mumbling, and nonverbal utterances. Use brackets for clear non-speech human sounds when helpful.'}
+         WORD_LEVEL_HIGHLIGHT: "True"
+         CONCURRENT_TRANSCRIPTIONS: "2"
+         TRANSCRIBE_OR_TRANSLATE: translate
+         USE_PATH_MAPPING: "False"
+         PROCMEDIAONPLAY: "False"
+         MODEL_PATH: /subgen/models
+         TRANSCRIBE_FOLDERS: /movies/downloads/metube
+         PROCADDEDMEDIA: "True"
+         TRANSCRIBE_DEVICE: cuda
+         SKIPIFINTERNALSUBLANG: eng
+         UPDATE: "False"
+         USE_MODEL_PROMPT: "False"
+         MONITOR: "True"
+         NAMESUBLANG: aa
+         STARTUP_SCAN_DB_PATH: "/subgen/state/subgen_scan.db"
+         STARTUP_SCAN_BENCHMARK_LOGGING: "True"
+         STARTUP_SCAN_BENCHMARK_LOG_PATH: "/subgen/state/startup_scan_benchmarks.jsonl"
+      volumes:
+         - "${APPDATA:-./.appdata}/subgen/models:/subgen/models"
+         - "${APPDATA:-./.appdata}/subgen/state:/subgen/state"
+         - subgen_network_drive:/movies:rw
+         - ./models:/subgen/models:rw
+      ports:
+         - "9000:9000"
+volumes:
+  subgen_network_drive:
+    external: true
+    name: subgen_network_drive
+      # # ⚠️ FOR Nvidia GPU IMAGE ⚠️
+      # # uncomment folllowing lines to pass nvidia gpu to the container
+      # deploy:
+      #    resources:
+      #       reservations:
+      #          devices:
+      #             - driver: nvidia
+      #               count: 1
+      #               capabilities:
+      #                  - gpu
+      #
+      #
+      # # ⚠️ For Native Linux AMD GPU IMAGE ⚠️
+      # # Change image to ngallodev/subgen:local and TRANSCRIBE_DEVICE to cuda, then
+      # # uncomment the following lines to pass an AMD GPU (ROCm) to the container.
+      # # 
+      # # CT2_CUDA_ALLOCATOR fixes GPU page faults on RDNA3 (gfx1100/1101) — OpenNMT/CTranslate2#2021
+      # # HSA_OVERRIDE_GFX_VERSION may be needed for newer RDNA GPUs not yet in ROCm's default target list.
+      #    environment:
+      #       - "CT2_CUDA_ALLOCATOR=cub_caching"
+      #       - "HSA_OVERRIDE_GFX_VERSION=11.0.0"  # adjust to your gfx version (e.g. 11.0.0 for RX 7900 series)
+      #       - "TRANSCRIBE_DEVICE=cuda"
+      #    devices:
+      #       - /dev/kfd
+      #       - /dev/dri
+      #    group_add:
+      #       - video
+      #       - render
+      #
+      #
+      # # ⚠️ For WSL AMD GPU IMAGE ⚠️
+      # # Requirements
+      # # WSL ubuntu 22.04 matching the CTranslate2 container base os running via WSL 2.
+      # # Librocmdxg https://github.com/ROCm/librocdxg
+      # # Change image to ngallodev/subgen:local and TRANSCRIBE_DEVICE to cuda, then
+      # # uncomment the following lines to pass an AMD GPU (ROCm) to the container.
+      #    environment:
+      #       - "HSA_ENABLE_DXG_DETECTION=1"
+      #       - "TRANSCRIBE_DEVICE=cuda"
+      #    devices:
+      #       - /dev/dxg
+      #    volumes:
+      #       - /usr/lib/wsl/lib/libdxcore.so:/lib/libdxcore.so
+      #       - /opt/rocm/lib/librocdxg.so:/lib/libdxcore.so
