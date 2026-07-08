@@ -57,9 +57,12 @@ import sys
 import threading
 import time
 import xml.etree.ElementTree as ET
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
 from datetime import datetime
+from functools import lru_cache
 from threading import Event, Lock, Timer
+from types import SimpleNamespace
 from typing import List, Union
 
 import av
@@ -76,6 +79,52 @@ from watchdog.events import FileSystemEventHandler
 from watchdog.observers.polling import PollingObserver as Observer
 
 from language_code import LanguageCode
+from scan_index import BenchmarkLogger, StartupScanDB, benchmark_step
+from subgen_startup_scan.association import (
+    current_sidecar_state as package_current_sidecar_state,
+    enrich_subtitle_records as package_enrich_subtitle_records,
+)
+from subgen_startup_scan.backend import build_startup_scan_backend
+from subgen_startup_scan.classifier import (
+    plan_media_record as package_plan_media_record,
+    prepare_media_queue_job as package_prepare_media_queue_job,
+)
+from subgen_startup_scan.config import (
+    get_startup_scan_monitor_async_start,
+    get_startup_scan_planner_trace_logging,
+)
+from subgen_startup_scan.dependencies import StartupScanDependencies
+from subgen_startup_scan.entrypoint import transcribe_existing_dispatch
+from subgen_startup_scan.facade import (
+    collect_startup_inventory as package_collect_startup_inventory,
+    is_relevant_inventory_file_name as package_is_relevant_inventory_file_name,
+    startup_scan_inventory_signature as package_startup_scan_inventory_signature,
+    startup_scan_inventory_signature_matches as package_startup_scan_inventory_signature_matches,
+    startup_scan_store_inventory_signature as package_startup_scan_store_inventory_signature,
+)
+from subgen_startup_scan.forced import startup_scan_existing_forced_language as package_forced_startup_scan_existing
+from subgen_startup_scan.inventory import StartupInventory
+from subgen_startup_scan.legacy import legacy_startup_scan_existing as package_legacy_startup_scan_existing
+from subgen_startup_scan.policy import startup_scan_policy_signature
+from subgen_startup_scan.runtime import (
+    initialize_startup_scan as package_startup_scan_initialize,
+    json_default as package_startup_scan_json_default,
+    refresh_processed_file as package_refresh_processed_file,
+    startup_scan_deserialize_audio_tracks as package_startup_scan_deserialize_audio_tracks,
+    startup_scan_get_media_row as package_startup_scan_get_media_row,
+    startup_scan_get_subtitle_rows as package_startup_scan_get_subtitle_rows,
+    startup_scan_process_record as package_startup_scan_process_record,
+    startup_scan_record_excluded as package_startup_scan_record_excluded,
+    startup_scan_record_media as package_startup_scan_record_media,
+    startup_scan_record_subtitle as package_startup_scan_record_subtitle,
+)
+from subgen_startup_scan.service import startup_scan_existing as package_startup_scan_existing
+from subgen_startup_scan.signatures import compute_subtitle_signature as package_compute_subtitle_signature
+from subgen_startup_scan.state import (
+    retain_startup_scan_observer as package_retain_startup_scan_observer,
+    run_with_startup_scan_lock as package_run_with_startup_scan_lock,
+)
+from subgen_startup_scan.traversal import collect_startup_records as package_startup_scan_collect_records
 
 
 def convert_to_bool(in_bool):
@@ -106,6 +155,14 @@ def get_env_with_fallback(new_name: str, old_name: str, default_value=None, conv
         return convert_func(value)
     
     return value
+
+
+def _get_positive_int_env(name: str, default_value: int) -> int:
+    try:
+        value = int(os.getenv(name, default_value))
+    except (TypeError, ValueError):
+        return default_value
+    return max(1, value)
     
 # Server Integration - with backwards compatibility
 plextoken = get_env_with_fallback('PLEX_TOKEN', 'PLEXTOKEN', 'token here')
@@ -181,6 +238,13 @@ skip_unknown_language = convert_to_bool(os.getenv('SKIP_UNKNOWN_LANGUAGE', False
 skip_if_no_audio_language_but_subtitles_exist = get_env_with_fallback('SKIP_IF_NO_LANGUAGE_BUT_SUBTITLES_EXIST', 'SKIP_IF_LANGUAGE_IS_NOT_SET_BUT_SUBTITLES_EXIST', False, convert_to_bool)
 ignore_forced_subtitles = convert_to_bool(os.getenv('IGNORE_FORCED_SUBTITLES', True))
 should_whisper_detect_audio_language = convert_to_bool(os.getenv('SHOULD_WHISPER_DETECT_AUDIO_LANGUAGE', False))
+startup_scan_db_path = get_env_with_fallback('STARTUP_SCAN_DB_PATH', 'SUBGEN_SCAN_DB_PATH', '/subgen/state/subgen_scan.db')
+startup_scan_benchmark_logging = convert_to_bool(os.getenv('STARTUP_SCAN_BENCHMARK_LOGGING', False))
+startup_scan_benchmark_log_path = os.getenv('STARTUP_SCAN_BENCHMARK_LOG_PATH', '/subgen/state/startup_scan_benchmarks.jsonl')
+startup_scan_planner_trace_logging = get_startup_scan_planner_trace_logging(False)
+startup_scan_monitor_async_start = get_startup_scan_monitor_async_start(True)
+startup_scan_force_rewalk = get_env_with_fallback('STARTUP_SCAN_FORCE_REWALK', 'STARTUP_SCAN_IGNORE_CACHE', False, convert_to_bool)
+startup_scan_classify_workers = _get_positive_int_env('STARTUP_SCAN_CLASSIFY_WORKERS', min(4, os.cpu_count() or 1))
 show_in_subname_subgen = convert_to_bool(os.getenv('SHOW_IN_SUBNAME_SUBGEN', True))
 show_in_subname_model = convert_to_bool(os.getenv('SHOW_IN_SUBNAME_MODEL', True))
 
@@ -294,25 +358,28 @@ class DeduplicatedQueue(queue.PriorityQueue):
         super().__init__()
         self._queued = set()     # Tracks task IDs waiting in queue
         self._processing = set() # Tracks task IDs currently being handled
+        self._counter = 0
         self._lock = Lock()
 
-    def put(self, item, block=True, timeout=None):
+    def put(self, item, block=True, timeout=None, force=False):
         with self._lock:
             task_id = item["path"]
-            if task_id not in self._queued and task_id not in self._processing:
+            if force or (task_id not in self._queued and task_id not in self._processing):
                 # Priority: 0 (Detect), 1 (ASR), 2 (Transcribe)
                 task_type = item.get("type", "transcribe")
                 priority = 0 if task_type == "detect_language" else (1 if task_type == "asr" else 2)
-                
-                # PriorityQueue requires a tuple: (priority, tie_breaker, item)
-                super().put((priority, time.time(), item), block, timeout)
+                mtime = item.get("mtime", 0) or 0
+
+                # Newer files sort first within the same task type.
+                self._counter += 1
+                super().put((priority, -mtime, self._counter, item), block, timeout)
                 self._queued.add(task_id)
                 return True
             return False
 
     def get(self, block=True, timeout=None):
         # PriorityQueue returns the tuple, we want just the item
-        priority, timestamp, item = super().get(block, timeout)
+        priority, neg_mtime, tie_breaker, item = super().get(block, timeout)
         with self._lock:
             task_id = item["path"]
             self._queued.discard(task_id)
@@ -343,6 +410,375 @@ class DeduplicatedQueue(queue.PriorityQueue):
 
 # Start queue
 task_queue = DeduplicatedQueue()
+
+
+SUBTITLE_FILE_EXTENSIONS = {'.srt', '.vtt', '.sub', '.ass', '.ssa', '.idx', '.sbv', '.pgs', '.ttml', '.lrc'}
+IGNORED_SCAN_DIR_NAMES = {'.git', '.hg', '.svn', '.idea', '__pycache__', 'lost+found'}
+
+
+def _startup_scan_probe_cache_info():
+    return SimpleNamespace(hits=0, misses=0, currsize=0, maxsize=0)
+
+
+def _safe_file_mtime(file_path: str) -> int:
+    try:
+        return int(os.path.getmtime(file_path))
+    except OSError:
+        return 0
+
+
+def is_subtitle_file_extension(file_name: str) -> bool:
+    return os.path.splitext(file_name)[1].lower() in SUBTITLE_FILE_EXTENSIONS
+
+
+def startup_scan_initialize():
+    package_run_with_startup_scan_lock(
+        package_startup_scan_initialize,
+        startup_scan_db_path,
+        db_factory=StartupScanDB,
+    )
+
+
+def _startup_scan_now() -> int:
+    return int(time.time())
+
+
+def _startup_scan_get_media_row(conn, path: str):
+    return package_startup_scan_get_media_row(conn, path)
+
+
+def _startup_scan_get_subtitle_rows(conn, media_path: str):
+    return package_startup_scan_get_subtitle_rows(conn, media_path)
+
+
+def _startup_scan_record_media(conn, path: str, size: int, mtime: int, has_audio: bool, audio_language, subtitle_state: str, decision: str, reason: str, last_seen: int) -> None:
+    package_startup_scan_record_media(
+        conn,
+        path,
+        size,
+        mtime,
+        has_audio,
+        audio_language,
+        subtitle_state,
+        decision,
+        reason,
+        last_seen,
+    )
+
+
+def _startup_scan_record_excluded(conn, path: str, size: int, mtime: int, reason: str, details: str, last_seen: int) -> None:
+    package_startup_scan_record_excluded(conn, path, size, mtime, reason, details, last_seen)
+
+
+def _startup_scan_record_subtitle(conn, path: str, size: int, mtime: int, media_path: str, subtitle_type: str, language, last_seen: int) -> None:
+    package_startup_scan_record_subtitle(conn, path, size, mtime, media_path, subtitle_type, language, last_seen)
+
+
+def _startup_scan_refresh_processed_file(path: str, transcription_type: str, force_language: LanguageCode, audio_tracks=None) -> None:
+    package_refresh_processed_file(
+        path,
+        transcription_type,
+        force_language,
+        audio_tracks=audio_tracks,
+        language_code=LanguageCode,
+        get_audio_tracks=get_audio_tracks,
+        choose_transcribe_language=choose_transcribe_language,
+        path_mapping=path_mapping,
+        name_subtitle=name_subtitle,
+        collect_startup_inventory=collect_startup_inventory,
+        compute_subtitle_signature=compute_subtitle_signature,
+        get_startup_policy_signature=get_startup_policy_signature,
+        db_factory=StartupScanDB,
+        startup_scan_db_path=startup_scan_db_path,
+    )
+
+
+def _startup_scan_current_sidecar_state(subtitle_rows: list[dict]) -> str:
+    return package_current_sidecar_state(subtitle_rows)
+
+
+def _startup_scan_json_default(value):
+    return package_startup_scan_json_default(value, language_code=LanguageCode)
+
+
+def _startup_scan_deserialize_audio_tracks(audio_tracks_json: str | None):
+    return package_startup_scan_deserialize_audio_tracks(
+        audio_tracks_json,
+        language_code=LanguageCode,
+    )
+
+
+def _startup_scan_enrich_subtitle_records(subtitle_records: list[dict], media_index: dict):
+    package_enrich_subtitle_records(
+        subtitle_records,
+        media_index,
+        from_string=LanguageCode.from_string,
+    )
+
+
+def _startup_scan_collect_records(root_path: str):
+    return package_startup_scan_collect_records(
+        root_path,
+        ignored_dir_names=IGNORED_SCAN_DIR_NAMES,
+        path_mapping=path_mapping,
+        is_subtitle_file_name=is_subtitle_file_extension,
+        has_video_extension=has_video_extension,
+        has_audio_extension=has_audio_extension,
+        enrich_subtitle_records=_startup_scan_enrich_subtitle_records,
+    )
+
+
+def describe_skip_reason(file_path: str, target_language: LanguageCode, audio_langs=None):
+    skipped = should_skip_file(file_path, target_language, audio_langs=audio_langs)
+    if not skipped:
+        return False, None, None
+    return True, "skipped", "Skipped by should_skip_file."
+
+
+def prepare_media_queue_job(
+    file_path: str,
+    transcription_type: str,
+    force_language: LanguageCode = LanguageCode.NONE,
+    force: bool = False,
+    audio_tracks=None,
+    **task_kwargs,
+):
+    return package_prepare_media_queue_job(
+        _build_startup_scan_dependencies(),
+        file_path,
+        transcription_type,
+        force_language,
+        force=force,
+        audio_tracks=audio_tracks,
+        **task_kwargs,
+    )
+
+
+def enqueue_media_job(
+    file_path: str,
+    transcription_type: str,
+    force_language: LanguageCode = LanguageCode.NONE,
+    force: bool = False,
+    audio_tracks=None,
+    **task_kwargs,
+):
+    task_kwargs.setdefault("mtime", _safe_file_mtime(file_path))
+    plan = prepare_media_queue_job(
+        file_path,
+        transcription_type,
+        force_language=force_language,
+        force=force,
+        audio_tracks=audio_tracks,
+        **task_kwargs,
+    )
+    if plan.get("status") in {"active", "skip"}:
+        return plan
+    task = plan.get("task")
+    if task:
+        task_queue.put(task, force=force)
+        plan["status"] = "queued"
+    return plan
+
+
+def queue_single_forced_file(
+    file_path: str,
+    transcription_type: Union[str, None] = None,
+    force_language: Union[str, None] = None,
+    audio_tracks=None,
+    allow_invalid: bool = False,
+):
+    if not file_path or not str(file_path).strip():
+        return {"status": "error", "message": "file_path is required"}
+
+    transcription_type = (transcription_type or transcribe_or_translate).lower()
+    if transcription_type not in {"transcribe", "translate"}:
+        return {"status": "error", "message": "transcription_type must be transcribe or translate"}
+
+    mapped_path = path_mapping(file_path)
+    if not allow_invalid:
+        if not os.path.exists(mapped_path):
+            return {"status": "error", "message": f"File not found: {mapped_path}"}
+        if not os.path.isfile(mapped_path):
+            return {"status": "error", "message": f"Path is not a file: {mapped_path}"}
+        base_name = os.path.basename(mapped_path)
+        if not (has_video_extension(base_name) or has_audio_extension(base_name)):
+            return {"status": "error", "message": f"Unsupported media file: {mapped_path}"}
+
+    force_language_code = LanguageCode.from_string(force_language) if force_language else LanguageCode.NONE
+    return enqueue_media_job(
+        mapped_path,
+        transcription_type,
+        force_language=force_language_code,
+        force=True,
+        audio_tracks=audio_tracks,
+    )
+
+
+def collect_startup_inventory(root_paths, recursive: bool = False, db: StartupScanDB | None = None):
+    return package_collect_startup_inventory(
+        root_paths,
+        recursive=recursive,
+        db=db,
+        has_video_extension=has_video_extension,
+        has_audio_extension=has_audio_extension,
+        enrich_subtitle_records=_startup_scan_enrich_subtitle_records,
+        json_default=_startup_scan_json_default,
+    )
+
+
+def _startup_scan_inventory_signature(inventory: StartupInventory, policy_signature: str):
+    return package_startup_scan_inventory_signature(inventory, policy_signature)
+
+
+def _startup_scan_store_inventory_signature(db: StartupScanDB, signature: dict) -> None:
+    package_startup_scan_store_inventory_signature(db, signature)
+
+
+def _startup_scan_inventory_signature_matches(db: StartupScanDB, signature: dict) -> bool:
+    return package_startup_scan_inventory_signature_matches(db, signature)
+
+
+def compute_subtitle_signature(media_path: str, inventory: StartupInventory, cache: dict):
+    return package_compute_subtitle_signature(media_path, inventory, cache)
+
+
+def get_startup_policy_signature():
+    return startup_scan_policy_signature(
+        transcribe_or_translate=transcribe_or_translate,
+        lrc_for_audio_files=lrc_for_audio_files,
+        skip_unknown_language=skip_unknown_language,
+        skip_if_no_audio_language_but_subtitles_exist=skip_if_no_audio_language_but_subtitles_exist,
+        limit_to_preferred_audio_languages=limit_to_preferred_audio_languages,
+        preferred_audio_languages=[lang.to_iso_639_2_t() for lang in preferred_audio_languages],
+        skip_audio_languages=[lang.to_iso_639_2_t() for lang in skip_audio_languages],
+        skip_if_target_subtitle_exists=skip_if_target_subtitle_exists,
+        subtitle_language_name=subtitle_language_name,
+        skip_if_internal_sub_language=skip_if_internal_sub_language.to_iso_639_2_t() if skip_if_internal_sub_language else "",
+        skip_subtitle_languages=[lang.to_iso_639_2_t() for lang in skip_subtitle_languages],
+        skip_if_external_sub_exists=skip_if_external_sub_exists,
+        only_match_subgen_subtitles=only_match_subgen_subtitles,
+        force_detected_language_to=force_detected_language_to.to_iso_639_2_t() if force_detected_language_to else "",
+        should_whisper_detect_audio_language=should_whisper_detect_audio_language,
+    )
+
+
+def _startup_scan_plan_media_record(
+    media: dict,
+    queue_path: str,
+    cached_row: dict | None,
+    inventory: StartupInventory,
+    subtitle_rows: list,
+    current_sidecar_state: str,
+):
+    return package_plan_media_record(
+        _build_startup_scan_dependencies(),
+        media,
+        queue_path,
+        cached_row,
+        inventory,
+        subtitle_rows,
+        current_sidecar_state,
+    )
+
+
+def _startup_scan_process_record(conn, media_record: dict, subtitle_rows: list, force_language: LanguageCode):
+    return package_startup_scan_process_record(
+        conn,
+        media_record,
+        subtitle_rows,
+        force_language,
+        task_queue=task_queue,
+        gen_subtitles_queue=gen_subtitles_queue,
+        prepare_media_queue_job=prepare_media_queue_job,
+        transcribe_or_translate=transcribe_or_translate,
+    )
+
+
+def startup_scan_existing(transcribe_folder_spec: str):
+    return package_startup_scan_existing(_build_startup_scan_dependencies(), transcribe_folder_spec)
+
+
+def _legacy_startup_scan_existing(transcribe_folder_spec: str) -> None:
+    folders = [path for path in transcribe_folder_spec.split("|") if path]
+    if skip_startup_scan:
+        logging.info("SKIP_STARTUP_SCAN is enabled - skipping existing file scan.")
+    else:
+        logging.info("Starting to search folders to see if we need to create subtitles.")
+        logging.debug("The folders are:")
+        for path in folders:
+            logging.debug(path)
+            for root, dirs, files in os.walk(path):
+                if SKIP_MARKER in files:
+                    logging.info(f"Skipping (skip marker present): {root}")
+                    dirs.clear()
+                    continue
+                for file_name in files:
+                    file_path = os.path.join(root, file_name)
+                    gen_subtitles_queue(path_mapping(file_path), transcribe_or_translate, LanguageCode.NONE)
+            if os.path.isfile(path) and has_audio(path):
+                gen_subtitles_queue(path_mapping(path), transcribe_or_translate, LanguageCode.NONE)
+
+    if not monitor:
+        return
+
+    observer = Observer()
+    for path in folders:
+        if os.path.isdir(path):
+            handler = NewFileHandler()
+            observer.schedule(handler, path, recursive=True)
+    observer.start()
+    package_retain_startup_scan_observer(observer)
+    logging.info("Finished searching and queueing files for transcription. Now watching for new files.")
+
+
+def _build_startup_scan_dependencies() -> StartupScanDependencies:
+    return StartupScanDependencies(
+        persistent_initialize=startup_scan_initialize,
+        persistent_startup_scan_existing=startup_scan_existing,
+        persistent_refresh_processed_file=_startup_scan_refresh_processed_file,
+        legacy_startup_scan_existing=_legacy_startup_scan_existing,
+        task_queue=task_queue,
+        language_code=LanguageCode,
+        has_audio=has_audio,
+        get_audio_tracks=get_audio_tracks,
+        choose_transcribe_language=choose_transcribe_language,
+        describe_skip_reason=describe_skip_reason,
+        should_whisper_detect_audio_language=should_whisper_detect_audio_language,
+        startup_scan_planner_trace_logging=startup_scan_planner_trace_logging,
+        startup_scan_force_rewalk=startup_scan_force_rewalk,
+        startup_scan_classify_workers=startup_scan_classify_workers,
+        startup_scan_benchmark_log_path=startup_scan_benchmark_log_path,
+        startup_scan_benchmark_logging=startup_scan_benchmark_logging,
+        startup_scan_db_path=startup_scan_db_path,
+        transcribe_or_translate=transcribe_or_translate,
+        monitor=monitor,
+        observer_factory=Observer,
+        new_file_handler_factory=NewFileHandler,
+        path_mapping=path_mapping,
+        current_sidecar_state=_startup_scan_current_sidecar_state,
+        deserialize_audio_tracks=_startup_scan_deserialize_audio_tracks,
+        json_default=_startup_scan_json_default,
+        gen_subtitles_queue=gen_subtitles_queue,
+        collect_startup_inventory=collect_startup_inventory,
+        compute_subtitle_signature=compute_subtitle_signature,
+        inventory_signature=_startup_scan_inventory_signature,
+        inventory_signature_matches=_startup_scan_inventory_signature_matches,
+        store_inventory_signature=_startup_scan_store_inventory_signature,
+        get_startup_policy_signature=get_startup_policy_signature,
+        probe_cache_info=_startup_scan_probe_cache_info,
+        benchmark_logger_factory=BenchmarkLogger,
+        benchmark_step=benchmark_step,
+        startup_scan_db_factory=StartupScanDB,
+        thread_pool_executor_factory=ThreadPoolExecutor,
+        plan_media_record=_startup_scan_plan_media_record,
+        startup_scan_monitor_async_start=startup_scan_monitor_async_start,
+        thread_factory=threading.Thread,
+        retain_observer=package_retain_startup_scan_observer,
+    )
+
+
+def _get_startup_scan_backend():
+    return build_startup_scan_backend(_build_startup_scan_dependencies(), default="legacy")
 
 # ============================================================================
 # TRANSCRIPTION WORKER
@@ -375,6 +811,12 @@ def transcription_worker():
                 asr_task_worker(task)
             else: # transcribe
                 gen_subtitles(task['path'], task['transcribe_or_translate'], task['force_language'], audio_tracks=task.get('audio_tracks'))
+                _get_startup_scan_backend().refresh_processed_file(
+                    task['path'],
+                    task.get('transcribe_or_translate') or transcribe_or_translate,
+                    task.get('force_language', LanguageCode.NONE),
+                    audio_tracks=task.get('audio_tracks'),
+                )
                 
                 # --- METADATA REFRESH LOGIC ---
                 if 'plex_item_id' in task:
@@ -706,6 +1148,17 @@ def batch(
         forceLanguage: Union[str, None] = Query(default=None)
 ):
     transcribe_existing(directory, LanguageCode.from_string(forceLanguage))
+
+
+@app.post("/force")
+def force_enqueue(payload: dict = Body(...)):
+    return queue_single_forced_file(
+        file_path=payload.get("file_path"),
+        transcription_type=payload.get("transcription_type"),
+        force_language=payload.get("force_language"),
+        audio_tracks=payload.get("audio_tracks"),
+        allow_invalid=bool(payload.get("allow_invalid", False)),
+    )
 
 # ============================================================================
 # REFACTORED /ASR ENDPOINT WITH HASH-BASED DEDUPLICATION AND BLOCKING
@@ -1804,7 +2257,78 @@ def choose_transcribe_language(file_path, forced_language, audio_tracks=None):
         return default_language
 
     return LanguageCode.NONE
-    
+
+
+def _media_probe_signature(file_path: str):
+    try:
+        stat_result = os.stat(file_path)
+    except OSError:
+        return None
+
+    return (
+        os.path.abspath(file_path),
+        int(stat_result.st_size),
+        int(getattr(stat_result, "st_mtime_ns", int(stat_result.st_mtime * 1_000_000_000))),
+    )
+
+
+@lru_cache(maxsize=8192)
+def _probe_media_streams_cached(file_path: str, file_size: int, file_mtime_ns: int):
+    del file_size, file_mtime_ns
+
+    audio_tracks = []
+    audio_languages = []
+    subtitle_languages = []
+
+    try:
+        probe = ffmpeg.probe(file_path)
+        for stream in probe.get("streams", []):
+            stream_type = stream.get("codec_type") or stream.get("type")
+            tags = stream.get("tags") or {}
+            language_tag = tags.get("language", "") or ""
+            language = LanguageCode.from_iso_639_2(language_tag) if language_tag else LanguageCode.NONE
+
+            if stream_type == "audio":
+                audio_track = {
+                    "index": int(stream.get("index", 0)),
+                    "codec": stream.get("codec_name", "Unknown"),
+                    "channels": int(stream.get("channels", 0)),
+                    "language": language,
+                    "title": tags.get("title", "None"),
+                    "default": stream.get("disposition", {}).get("default", 0) == 1,
+                    "forced": stream.get("disposition", {}).get("forced", 0) == 1,
+                    "original": stream.get("disposition", {}).get("original", 0) == 1,
+                    "commentary": "commentary" in tags.get("title", "").lower(),
+                }
+                audio_tracks.append(audio_track)
+                audio_languages.append(language)
+            elif stream_type == "subtitle":
+                subtitle_languages.append(language)
+    except ffmpeg.Error as e:
+        logging.error(f"FFmpeg error: {e.stderr}")
+    except Exception as e:
+        logging.error(f"An error occurred while probing stream metadata for {file_path}: {str(e)}")
+
+    return {
+        "audio_tracks": audio_tracks,
+        "audio_languages": audio_languages,
+        "subtitle_languages": subtitle_languages,
+        "has_audio": bool(audio_tracks),
+    }
+
+
+def _probe_media_streams(file_path: str):
+    signature = _media_probe_signature(file_path)
+    if signature is None:
+        return {
+            "audio_tracks": [],
+            "audio_languages": [],
+            "subtitle_languages": [],
+            "has_audio": False,
+        }
+    return _probe_media_streams_cached(*signature)
+
+
 def get_audio_tracks(video_file):
     """
     Extracts information about the audio tracks in a file.
@@ -1822,34 +2346,7 @@ def get_audio_tracks(video_file):
             original (bool): Whether the audio track is the original.
             commentary (bool): Whether the audio track is a commentary.
     """
-    try:
-        # Probe the file to get audio stream metadata
-        probe = ffmpeg.probe(video_file, select_streams='a')
-        audio_streams = probe.get('streams',[])
-        
-        # Extract information for each audio track
-        audio_tracks =[]
-        for stream in audio_streams:
-            audio_track = {
-                "index": int(stream.get("index", 0)),
-                "codec": stream.get("codec_name", "Unknown"),
-                "channels": int(stream.get("channels", 0)),
-                "language": LanguageCode.from_iso_639_2(stream.get("tags", {}).get("language", "Unknown")),
-                "title": stream.get("tags", {}).get("title", "None"),
-                "default": stream.get("disposition", {}).get("default", 0) == 1,
-                "forced": stream.get("disposition", {}).get("forced", 0) == 1,
-                "original": stream.get("disposition", {}).get("original", 0) == 1,
-                "commentary": "commentary" in stream.get("tags", {}).get("title", "").lower()
-            }
-            audio_tracks.append(audio_track) 
-        return audio_tracks
-
-    except ffmpeg.Error as e:
-        logging.error(f"FFmpeg error: {e.stderr}")
-        return[]
-    except Exception as e:
-        logging.error(f"An error occurred while reading audio track information: {str(e)}")
-        return[]
+    return _probe_media_streams(video_file)["audio_tracks"]
 
 def find_language_audio_track(audio_tracks, find_languages):
     """
@@ -2034,23 +2531,20 @@ def get_subtitle_languages(video_path):
     :param video_path: Path to the video file
     :return: List of language codes for each subtitle stream
     """
-    languages = []
+    subtitle_languages = _probe_media_streams(video_path)["subtitle_languages"]
+    if subtitle_languages:
+        return subtitle_languages
 
     try:
         with av.open(video_path) as container:
-            for stream in container.streams.subtitles:
-                if ignore_forced_subtitles and bool(stream.disposition & av.stream.Disposition.forced):
-                    logging.debug(f"get_subtitle_languages: skipping forced subtitle stream in {video_path}")
-                    continue
-                lang_code = stream.metadata.get('language')
-                if lang_code:
-                    languages.append(LanguageCode.from_iso_639_2(lang_code))
-                else:
-                    languages.append(LanguageCode.NONE)
-    except Exception as e:
-        logging.warning(f"Could not read subtitle streams from {video_path}: {e}")
-
-    return languages
+            languages = []
+            for stream in getattr(container.streams, "subtitles", []):
+                language = LanguageCode.from_iso_639_2((stream.metadata or {}).get("language", ""))
+                if language != LanguageCode.NONE:
+                    languages.append(language)
+            return languages
+    except Exception:
+        return []
 
 def get_audio_languages(video_path):
     """
@@ -2059,8 +2553,7 @@ def get_audio_languages(video_path):
     :param video_path: Path to the video file
     :return: List of language codes for each audio stream
     """
-    audio_tracks = get_audio_tracks(video_path)
-    return [track['language'] for track in audio_tracks] 
+    return _probe_media_streams(video_path)["audio_languages"]
 
 def subtitle_exists_in_language(video_file, target_language: LanguageCode):
     """
@@ -2092,28 +2585,7 @@ def has_internal_subtitle_in_language(video_file: str, target_language: Language
     Returns:
         True if a matching embedded subtitle stream is found, False otherwise.
     """
-    try:
-        with av.open(video_file) as container:
-            for stream in container.streams:
-                lang_tag = stream.metadata.get('language', '') if stream.metadata else ''
-                is_forced = bool(stream.disposition & av.stream.Disposition.forced)
-                logging.debug(
-                    f"has_internal_subtitle_in_language: stream #{stream.index} "
-                    f"type={stream.type!r} lang={lang_tag!r} forced={is_forced} "
-                    f"target={target_language}"
-                )
-                if stream.type == 'subtitle' and 'language' in stream.metadata:
-                    if ignore_forced_subtitles and is_forced:
-                        logging.debug(f"Skipping forced subtitle stream (language={lang_tag}) in {video_file}")
-                        continue
-                    stream_language = LanguageCode.from_string(lang_tag.lower())
-                    if stream_language == target_language:
-                        return True
-            return False
-
-    except Exception as e:
-        logging.error(f"An error occurred while checking the file with pyav: {type(e).__name__}: {e}")
-        return False
+    return target_language in _probe_media_streams(video_file)["subtitle_languages"]
 
 def has_external_subtitle_in_language(video_file: str, target_language: LanguageCode, recursion: bool = True, only_match_subgen_subtitles: bool = False) -> bool:
     """Checks if the given folder has a subtitle file with the given language.
@@ -2408,27 +2880,13 @@ def get_jellyfin_admin(users):
     raise Exception("Unable to find administrator user in Jellyfin")
 
 def has_audio(file_path):
-    try:
-        if not is_valid_path(file_path):
-            return False
-
-        if not (has_video_extension(file_path) or has_audio_extension(file_path)):
-            return False
-
-        with av.open(file_path) as container:
-            # Check for an audio stream and ensure it has a valid codec
-            for stream in container.streams:
-                if stream.type == 'audio':
-                    # Check if the stream has a codec and if it is valid
-                    if stream.codec_context and stream.codec_context.name != 'none':
-                        return True
-                    else:
-                        logging.debug(f"Unsupported or missing codec for audio stream in {file_path}")
-            return False
-
-    except (av.FFmpegError, UnicodeDecodeError):
-        logging.debug(f"Error processing file {file_path}")
+    if not is_valid_path(file_path):
         return False
+
+    if not (has_video_extension(file_path) or has_audio_extension(file_path)):
+        return False
+
+    return _probe_media_streams(file_path)["has_audio"]
 
 def is_valid_path(file_path):
     # Check if the path is a file
@@ -2519,35 +2977,31 @@ class NewFileHandler(FileSystemEventHandler):
 
 
 def transcribe_existing(transcribe_folders, forceLanguage: LanguageCode = LanguageCode.NONE):
-    transcribe_folders = transcribe_folders.split("|")
-    if skip_startup_scan:
-        logging.info("SKIP_STARTUP_SCAN is enabled — skipping existing file scan.")
-    else:
-        logging.info("Starting to search folders to see if we need to create subtitles.")
-        logging.debug("The folders are:")
-        for path in transcribe_folders:
-            logging.debug(path)
-            for root, dirs, files in os.walk(path):
-                if SKIP_MARKER in files:
-                    logging.info(f"Skipping (skip marker present): {root}")
-                    dirs.clear()
-                    continue
-                for file in files:
-                    file_path = os.path.join(root, file)
-                    gen_subtitles_queue(path_mapping(file_path), transcribe_or_translate, forceLanguage)
-            # if the path specified was actually a single file and not a folder, process it
-            if os.path.isfile(path):
-                if has_audio(path):
-                    gen_subtitles_queue(path_mapping(path), transcribe_or_translate, forceLanguage)
-    # Set up the observer to watch for new files
-    if monitor:
-        observer = Observer()
-        for path in transcribe_folders:
-            if os.path.isdir(path):
-                handler = NewFileHandler()
-                observer.schedule(handler, path, recursive=True)
-        observer.start()
-        logging.info("Finished searching and queueing files for transcription. Now watching for new files.")
+    def _run_forced_language_scan(folder_spec: str, forced_language: LanguageCode):
+        package_run_with_startup_scan_lock(
+            package_forced_startup_scan_existing,
+            folder_spec,
+            forced_language,
+            startup_scan_db_path=startup_scan_db_path,
+            db_factory=StartupScanDB,
+            startup_scan_now=_startup_scan_now,
+            collect_records=_startup_scan_collect_records,
+            record_subtitle=_startup_scan_record_subtitle,
+            process_record=_startup_scan_process_record,
+            monitor=monitor,
+            observer_factory=Observer,
+            new_file_handler_factory=NewFileHandler,
+            retain_observer=package_retain_startup_scan_observer,
+        )
+
+    transcribe_existing_dispatch(
+        transcribe_folders,
+        forceLanguage,
+        language_code_none=LanguageCode.NONE,
+        get_backend=_get_startup_scan_backend,
+        initialize=startup_scan_initialize,
+        run_forced_language_scan=_run_forced_language_scan,
+    )
 
 
 if __name__ == "__main__":
