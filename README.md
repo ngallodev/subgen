@@ -260,9 +260,9 @@ Create two separate Webhooks in Tautulli pointing to `http://<your-ip>:9000/taut
 | `PROCESS_MEDIA_ON_PLAY` | `True` | Generate subs for media when it is played (when triggered by webhook). |
 | `TRANSCRIBE_FOLDERS` | `''` | Pipe-separated list (e.g., `/tv&#124;/movies`) to recurse through and queue existing media. |
 | `MONITOR` | `False` | Actively watches `TRANSCRIBE_FOLDERS` in real-time for newly pasted files. |
-| `STARTUP_SCAN_BACKEND` | `persistent` | Selects startup scan behavior. Use `persistent` for the SQLite-backed cached scanner or `legacy` for the stock recursive scan path. |
+| `STARTUP_SCAN_BACKEND` | `legacy` | Selects startup scan behavior. Use `legacy` for the stock recursive scan path or `persistent` for the SQLite-backed cached scanner. |
 | `STARTUP_SCAN_DB_PATH` | `/subgen/state/subgen_scan.db` | SQLite cache for startup scan state, excluded files, and subtitle inventory. |
-| `STARTUP_SCAN_BENCHMARK_LOGGING` | `False` | Writes startup scan timing records to a JSONL log file. |
+| `STARTUP_SCAN_BENCHMARK_LOGGING` | `False` | Opt-in startup scan timing. When enabled, writes structured JSONL timing records to the configured benchmark log path. |
 | `STARTUP_SCAN_BENCHMARK_LOG_PATH` | `/subgen/state/startup_scan_benchmarks.jsonl` | Host-mounted log file for benchmark output. |
 | `STARTUP_SCAN_PLANNER_TRACE_LOGGING` | `False` | Adds opt-in planner sub-step timings for startup scan classification and queue decisions. |
 | `STARTUP_SCAN_MONITOR_ASYNC_START` | `True` | Starts the recursive monitor in the background so warm startup does not block on watcher initialization. |
