@@ -2,7 +2,7 @@ import json
 import time
 from typing import Any
 
-from .benchmarks import round_benchmark_fields
+from .benchmarks import round_benchmark_fields, summarize_parallel_plan_detail
 from .dependencies import StartupScanDependencies
 
 
@@ -49,13 +49,26 @@ def prepare_media_queue_job(
 
     started_at = time.perf_counter()
     if audio_tracks is None:
-        has_audio_flag = deps.has_audio(file_path)
+        audio_tracks = deps.get_audio_tracks(file_path)
+        has_audio_flag = bool(audio_tracks)
     else:
         has_audio_flag = bool(audio_tracks)
+        audio_tracks = [
+            {
+                **track,
+                "language": track["language"]
+                if isinstance(track.get("language"), deps.language_code)
+                else deps.language_code.from_string(track.get("language")),
+            }
+            for track in audio_tracks
+            if isinstance(track, dict)
+        ]
         if trace is not None:
             trace["used_cached_audio_tracks"] = True
     if trace is not None:
-        trace["has_audio_ms"] = (time.perf_counter() - started_at) * 1000
+        trace["has_audio_ms"] = 0.0
+        trace["audio_tracks_ms"] = (time.perf_counter() - started_at) * 1000
+        trace["audio_track_count"] = len(audio_tracks)
 
     if not has_audio_flag:
         return {
@@ -67,24 +80,6 @@ def prepare_media_queue_job(
             "audio_langs": [],
             "planner_trace": trace,
         }
-
-    started_at = time.perf_counter()
-    if audio_tracks is None:
-        audio_tracks = deps.get_audio_tracks(file_path)
-    else:
-        audio_tracks = [
-            {
-                **track,
-                "language": track["language"]
-                if isinstance(track.get("language"), deps.language_code)
-                else deps.language_code.from_string(track.get("language")),
-            }
-            for track in audio_tracks
-            if isinstance(track, dict)
-        ]
-    if trace is not None:
-        trace["audio_tracks_ms"] = (time.perf_counter() - started_at) * 1000
-        trace["audio_track_count"] = len(audio_tracks)
 
     started_at = time.perf_counter()
     audio_langs = [
@@ -198,16 +193,8 @@ def plan_media_record(
     cached_row: dict | None,
     inventory,
     subtitle_rows: list,
-    current_sidecar_state: str,
+    current_sidecar_state: str | None,
 ):
-    signature_started_at = time.perf_counter()
-    subtitle_signature, matching_subtitles = deps.compute_subtitle_signature(
-        media["path"],
-        inventory,
-        {},
-    )
-    signature_ms = (time.perf_counter() - signature_started_at) * 1000
-
     plan_started_at = time.perf_counter()
     plan = prepare_media_queue_job(
         deps,
@@ -217,6 +204,31 @@ def plan_media_record(
         audio_tracks=deps.deserialize_audio_tracks(cached_row.get("audio_tracks_json")) if cached_row else None,
     )
     plan_ms = (time.perf_counter() - plan_started_at) * 1000
+
+    if plan["status"] in {"skip", "active"}:
+        return {
+            "media": media,
+            "queue_path": queue_path,
+            "cached_row": cached_row,
+            "subtitle_rows": subtitle_rows,
+            "current_sidecar_state": current_sidecar_state,
+            "subtitle_signature": "",
+            "matching_subtitles": [],
+            "plan": plan,
+            "signature_ms": 0.0,
+            "subtitle_signature_ms": 0.0,
+            "plan_ms": plan_ms,
+            "queue_plan_ms": plan_ms,
+        }
+
+    signature_started_at = time.perf_counter()
+    subtitle_signature, matching_subtitles = deps.compute_subtitle_signature(
+        media["path"],
+        inventory,
+        {},
+    )
+    signature_ms = (time.perf_counter() - signature_started_at) * 1000
+
     return {
         "media": media,
         "queue_path": queue_path,
@@ -227,7 +239,9 @@ def plan_media_record(
         "matching_subtitles": matching_subtitles,
         "plan": plan,
         "signature_ms": signature_ms,
+        "subtitle_signature_ms": signature_ms,
         "plan_ms": plan_ms,
+        "queue_plan_ms": plan_ms,
     }
 
 
@@ -338,7 +352,7 @@ def classify_media(
                 cached_row = None if deps.startup_scan_force_rewalk else cached_media_by_path.get(queue_path)
                 cached_excluded = None if deps.startup_scan_force_rewalk else cached_excluded_by_path.get(queue_path)
                 subtitle_rows = subtitle_rows_by_media.get(media["path"], [])
-                current_sidecar_state = deps.current_sidecar_state(subtitle_rows)
+                current_sidecar_state = None
 
                 if _matches_cached_record(media, cached_excluded, policy_signature):
                     totals["reused"] += 1
@@ -374,6 +388,7 @@ def classify_media(
                     continue
 
                 if _matches_cached_record(media, cached_row, policy_signature):
+                    current_sidecar_state = deps.current_sidecar_state(subtitle_rows)
                     cached_state = cached_row.get("subtitle_state", "unknown")
                     if current_sidecar_state == "none" and cached_state in {"none", "unknown", "internal"}:
                         if queue_cached_job(deps, queue_path, cached_row):
@@ -463,6 +478,10 @@ def classify_media(
                 queue_count=sum(1 for result in plan_results if result.get("plan", {}).get("status") in {"queue", "queued"}),
                 detect_count=sum(1 for result in plan_results if result.get("plan", {}).get("status") == "detect"),
             )
+            if deps.startup_scan_planner_trace_logging:
+                parallel_plan_detail = summarize_parallel_plan_detail(plan_results)
+                if parallel_plan_detail:
+                    benchmark_logger.write("startup_scan.classify_media.parallel_plan_detail", **parallel_plan_detail)
             planner_trace = _aggregate_planner_trace(plan_results)
             if planner_trace:
                 benchmark_logger.write("startup_scan.classify_media.parallel_plan_trace", **planner_trace)

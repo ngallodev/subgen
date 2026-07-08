@@ -86,6 +86,7 @@ These files remain local-only in the host-mounted state volume and are not inten
 | --- | --- | ---: | ---: | ---: | ---: |
 | Persistent warm baseline before stock reset | prior extracted-backend branch | 1437.274 ms | 112.490 ms | 59.855 ms | 7080.813 ms |
 | Persistent warm after seam reapply | `55bebbf` | 2554.762 ms | 377.958 ms | 36.409 ms | 6205.579 ms |
+| Persistent warm after planner optimizations | current working tree verification run | 1949.813 ms | 473.110 ms | 102.183 ms | 6826.118 ms |
 
 Observations:
 
@@ -123,6 +124,42 @@ Interpretation:
 - the dominant cold bottleneck is planner work during `classify_media.parallel_plan`
 - the persistent backend cache is highly effective once the DB is populated
 
+### Subset A Optimization Progression
+
+The same `Subset A` dataset was rerun after two cold-path planner optimizations:
+
+1. defer subtitle-signature work for early `skip` and `active` outcomes
+2. use `get_audio_tracks()` as the single audio probe in planner queue preparation instead of separate `has_audio()` and `get_audio_tracks()` calls
+
+| Scenario | `startup_scan.inventory` | `startup_scan.classify_media.parallel_plan` | `startup_scan.classify_media` | `startup_scan.total` |
+| --- | ---: | ---: | ---: | ---: |
+| Baseline cold from `55bebbf` | 6748.547 ms | 57940.420 ms | 58059.195 ms | 65310.959 ms |
+| After early skip/active signature deferral | 5630.881 ms | 51857.729 ms | 52092.994 ms | 58708.079 ms |
+| After single-probe planner path | 5773.772 ms | 33582.755 ms | 33689.213 ms | 39939.568 ms |
+
+Cold-path deltas versus baseline:
+
+- deferring subtitle signatures reduced cold `parallel_plan` by `6082.691 ms` and cold `total` by `6602.880 ms`
+- switching planner probe work to a single `get_audio_tracks()` call reduced cold `parallel_plan` by `24357.665 ms` and cold `total` by `25371.391 ms`
+- combined cold improvement from baseline to the latest run:
+  - `startup_scan.classify_media.parallel_plan`: `57940.420 ms` -> `33582.755 ms` (`24357.665 ms`, about `42.0%` faster)
+  - `startup_scan.total`: `65310.959 ms` -> `39939.568 ms` (`25371.391 ms`, about `38.8%` faster)
+
+Latest warm rerun on the same temp DB after both optimizations:
+
+| Scenario | `startup_scan.inventory` | `startup_scan.subtitle_relink` | `startup_scan.monitor_setup` | `startup_scan.total` |
+| --- | ---: | ---: | ---: | ---: |
+| Baseline warm from `55bebbf` | 322.967 ms | 14.253 ms | 12.476 ms | 1670.380 ms |
+| Warm after first planner optimization | 30.098 ms | 5.207 ms | 60.829 ms | 935.574 ms |
+| Warm after both planner optimizations | 34.597 ms | 13.308 ms | 3.844 ms | 371.956 ms |
+
+Interpretation:
+
+- the new planner changes materially improved cold startup on the 33-file uncached subset
+- warm subset performance also improved substantially and remained sub-second total
+- inventory is no longer the dominant cold cost on this subset
+- the remaining cold bottleneck is still planner work, but the next target has shifted
+
 ## Practical Takeaways For PR Discussion
 
 1. The seam reapply on stock-based `subgen.py` is functionally intact and does not cause a broad warm-start regression in overall startup time.
@@ -130,6 +167,44 @@ Interpretation:
 3. Empty-DB cold runs remain dominated by planner work, not by recursive directory inventory.
 4. Any next performance PR should focus first on reducing `startup_scan.classify_media.parallel_plan` cost on uncached media.
 5. Full-library empty-DB cold runs are impractical on the real library; sanitized subset cold/warm runs are the right repeatable benchmark format for PR evidence.
+
+
+## Planner Detail Rows
+
+When planner-trace logging is enabled, `classify_media` now writes an additional opt-in row:
+
+- `startup_scan.classify_media.parallel_plan_detail`
+  - `pending_count`
+  - `traced_count`
+  - `subtitle_signature_total_ms`, `subtitle_signature_avg_ms`, `subtitle_signature_max_ms`
+  - `queue_plan_total_ms`, `queue_plan_avg_ms`, `queue_plan_max_ms`
+  - `probe_total_ms`, `probe_avg_ms`, `probe_max_ms`
+  - `language_total_ms`, `language_avg_ms`, `language_max_ms`
+  - `detect_total_ms`, `detect_avg_ms`, `detect_max_ms`
+  - `active_check_ms_*`, `has_audio_ms_*`, `audio_tracks_ms_*`, `audio_langs_ms_*`
+  - `choose_language_ms_*`, `skip_check_ms_*`, `detect_branch_ms_*`
+  - `cached_audio_track_plan_count`
+  - `audio_track_count_total`
+  - `audio_lang_count_total`
+
+The existing `startup_scan.classify_media.parallel_plan_breakdown` and `startup_scan.classify_media.parallel_plan_trace` rows remain unchanged, so older benchmark comparisons still line up.
+
+Latest measured planner-detail takeaway from the final `Subset A` cold rerun:
+
+- `subtitle_signature_total_ms`: `0.0 ms`
+- `queue_plan_total_ms`: `132186.979 ms`
+- `probe_total_ms`: `74126.712 ms`
+- `language_total_ms`: `58059.864 ms`
+- `detect_total_ms`: `0.0 ms`
+- dominant sub-slices inside the trace rollup:
+  - `audio_tracks_ms_total_ms`: `74126.525 ms`
+  - `skip_check_ms_total_ms`: `58059.569 ms`
+  - `has_audio_ms_total_ms`: `0.0 ms`
+
+Interpretation:
+
+- the previous `has_audio()` probe cost has effectively been eliminated from this path
+- the next cold-start target is now `describe_skip_reason()` / skip-check work, with `get_audio_tracks()` still the largest remaining probe slice
 
 ## Follow-Up Benchmark Recommendations
 

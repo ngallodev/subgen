@@ -11,6 +11,8 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
 import subgen
 from language_code import LanguageCode
+from subgen_startup_scan.classifier import plan_media_record as package_plan_media_record
+from subgen_startup_scan.dependencies import StartupScanDependencies
 
 
 def _set_db_path(monkeypatch, tmp_path):
@@ -875,6 +877,68 @@ def test_startup_scan_uses_parallel_planning_executor(monkeypatch, tmp_path):
     assert any(event == "startup_scan.classify_media.preflight" for event, _ in events)
     assert any(event == "startup_scan.classify_media.parallel_plan" for event, _ in events)
     assert any(event == "startup_scan.classify_media.apply" for event, _ in events)
+
+
+def test_plan_media_record_defers_signature_when_skip_is_known(monkeypatch):
+    calls = []
+
+    deps = StartupScanDependencies(
+        task_queue=type("Queue", (), {"is_active": staticmethod(lambda path: False)})(),
+        language_code=LanguageCode,
+        has_audio=lambda path: (_ for _ in ()).throw(AssertionError("has_audio should not be called")),
+        get_audio_tracks=lambda path: calls.append(("audio_tracks", path)) or [],
+        choose_transcribe_language=lambda file_path, force_language, audio_tracks=None: force_language,
+        describe_skip_reason=lambda file_path, target_language, audio_langs=None: (False, "", ""),
+        should_whisper_detect_audio_language=False,
+        transcribe_or_translate="transcribe",
+        deserialize_audio_tracks=lambda value: [],
+        compute_subtitle_signature=lambda *args, **kwargs: calls.append(("signature", args[0])) or ("sig", []),
+    )
+
+    result = package_plan_media_record(
+        deps,
+        {"path": "/media/movie.mkv", "size": 1, "mtime": 2},
+        "/media/movie.mkv",
+        None,
+        object(),
+        [],
+        None,
+    )
+
+    assert result["plan"]["status"] == "skip"
+    assert result["subtitle_signature"] == ""
+    assert calls == [("audio_tracks", "/media/movie.mkv")]
+
+
+def test_plan_media_record_keeps_signature_for_queue_paths(monkeypatch):
+    calls = []
+
+    deps = StartupScanDependencies(
+        task_queue=type("Queue", (), {"is_active": staticmethod(lambda path: False)})(),
+        language_code=LanguageCode,
+        has_audio=lambda path: (_ for _ in ()).throw(AssertionError("has_audio should not be called")),
+        get_audio_tracks=lambda path: [{"language": LanguageCode.ENGLISH}],
+        choose_transcribe_language=lambda file_path, force_language, audio_tracks=None: LanguageCode.ENGLISH,
+        describe_skip_reason=lambda file_path, target_language, audio_langs=None: (False, "", ""),
+        should_whisper_detect_audio_language=False,
+        transcribe_or_translate="transcribe",
+        deserialize_audio_tracks=lambda value: [],
+        compute_subtitle_signature=lambda *args, **kwargs: calls.append(("signature", args[0])) or ("sig", []),
+    )
+
+    result = package_plan_media_record(
+        deps,
+        {"path": "/media/movie.mkv", "size": 1, "mtime": 2},
+        "/media/movie.mkv",
+        None,
+        object(),
+        [],
+        None,
+    )
+
+    assert result["plan"]["status"] == "queue"
+    assert result["subtitle_signature"] == "sig"
+    assert calls == [("signature", "/media/movie.mkv")]
 
 
 def test_benchmark_logger_respects_env_toggle(tmp_path):
