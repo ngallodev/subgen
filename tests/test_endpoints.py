@@ -206,6 +206,32 @@ class TestJellyfin:
 
 
 # ---------------------------------------------------------------------------
+# /force
+# ---------------------------------------------------------------------------
+class TestForce:
+    def test_force_route_uses_shared_helper(self, client):
+        with patch.object(subgen, "queue_single_forced_file", return_value={"status": "queued"}) as mock_force:
+            resp = client.post(
+                "/force",
+                json={
+                    "file_path": "/media/show.mkv",
+                    "transcription_type": "transcribe",
+                    "force_language": "eng",
+                    "allow_invalid": False,
+                },
+            )
+        assert resp.status_code == 200
+        assert resp.json()["status"] == "queued"
+        mock_force.assert_called_once_with(
+            file_path="/media/show.mkv",
+            transcription_type="transcribe",
+            force_language="eng",
+            audio_tracks=None,
+            allow_invalid=False,
+        )
+
+
+# ---------------------------------------------------------------------------
 # /emby
 # ---------------------------------------------------------------------------
 class TestEmby:

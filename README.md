@@ -6,8 +6,6 @@
 <details>
 <summary><strong>Updates:</strong></summary>
 
-7 Jun 2026: Fixed a bug where files containing only a **forced** embedded subtitle track were incorrectly treated as having full subtitle coverage and skipped. Forced tracks cover only a small fraction of dialogue (typically foreign-language inserts) and should not count as full coverage. Added `IGNORE_FORCED_SUBTITLES` (default `True`) to control this behaviour.
-
 11 Apr 2026: Fixed subtitle timing on files with audio stream offsets (common in Amazon WEB-DL). Whisper ignores silence padding, causing subtitles to be early by the offset amount. Subgen now detects this via ffprobe and compensates automatically when the source video file is accessible. See [Audio Start-Time Offset Fix](#-audio-start-time-offset-fix) for details.
 
 27 Mar 2026: Potentially added ROCm support for AMD GPU/APUs. I don't have anything to test it, so a fair chance it doesn't work at all.  I'm unsure if it will work with AMD APUs.  Image is: `mccloud/subgen:amd`.  It's pretty large right now at ~10gb. In theory, it should see your AMD card the same way it sees any other cuda device. Some light research shows ROCm only 'officially' supports higher end consumer cards and datacenter cards. `HSA_OVERRIDE_GFX_VERSION` can be set to 'trick' your old cards (and maybe APUs) to work, but you'll have to do your own research/googling. 
@@ -161,6 +159,25 @@ The easiest way to run Subgen is via Docker. We maintain an image on Docker Hub 
 
 **Crucial Note on Volume Mapping:** If you are using Plex/Emby/Jellyfin/Tautulli webhooks, **Subgen must see your media paths exactly identically to how your media server sees them.** For example, if Plex uses `/Share/media/TV:/tv`, Subgen needs that exact same volume mount. *(Note: This does not apply to Bazarr, which sends audio over HTTP).*
 
+### 1b. Local Registry
+If you want to build and push to the local registry on this host:
+
+```bash
+docker tag ngallodev/subgen:local 127.0.0.1:5000/ngallodev/subgen:local
+docker push 127.0.0.1:5000/ngallodev/subgen:local
+docker pull 127.0.0.1:5000/ngallodev/subgen:local
+docker tag ngallodev/subgen:local registry.home.arpa:5000/ngallodev/subgen:local
+docker push registry.home.arpa:5000/ngallodev/subgen:local
+```
+
+From another machine on the LAN:
+
+```bash
+docker pull registry.home.arpa:5000/ngallodev/subgen:local
+```
+
+That other machine must trust `registry.home.arpa:5000` as an insecure registry unless you put TLS in front of it.
+
 ### 2. Standalone (Without Docker)
 1. Install Python 3.9–3.11 and `ffmpeg`.
 2. Ensure you have the proper NVIDIA drivers/CUDA toolkit installed (if using GPU).
@@ -243,7 +260,12 @@ Create two separate Webhooks in Tautulli pointing to `http://<your-ip>:9000/taut
 | `PROCESS_MEDIA_ON_PLAY` | `True` | Generate subs for media when it is played (when triggered by webhook). |
 | `TRANSCRIBE_FOLDERS` | `''` | Pipe-separated list (e.g., `/tv&#124;/movies`) to recurse through and queue existing media. |
 | `MONITOR` | `False` | Actively watches `TRANSCRIBE_FOLDERS` in real-time for newly pasted files. |
-| `SKIP_STARTUP_SCAN` | `False` | Skips the startup scan of `TRANSCRIBE_FOLDERS` entirely. Subgen will still watch for new files if `MONITOR` is enabled, but won't iterate existing files on start. Useful if your library is already subtitled and you only want to catch newly added files. |
+| `STARTUP_SCAN_BACKEND` | `persistent` | Selects startup scan behavior. Use `persistent` for the SQLite-backed cached scanner or `legacy` for the stock recursive scan path. |
+| `STARTUP_SCAN_DB_PATH` | `/subgen/state/subgen_scan.db` | SQLite cache for startup scan state, excluded files, and subtitle inventory. |
+| `STARTUP_SCAN_BENCHMARK_LOGGING` | `False` | Writes startup scan timing records to a JSONL log file. |
+| `STARTUP_SCAN_BENCHMARK_LOG_PATH` | `/subgen/state/startup_scan_benchmarks.jsonl` | Host-mounted log file for benchmark output. |
+| `STARTUP_SCAN_PLANNER_TRACE_LOGGING` | `False` | Adds opt-in planner sub-step timings for startup scan classification and queue decisions. |
+| `STARTUP_SCAN_MONITOR_ASYNC_START` | `True` | Starts the recursive monitor in the background so warm startup does not block on watcher initialization. |
 | `PLEX_QUEUE_NEXT_EPISODE` | `False` | Auto-queues the *next* Plex episode when Subgen is triggered. |
 | `PLEX_QUEUE_SEASON` | `False` | Auto-queues the *entire remaining season* when Subgen is triggered. |
 | `PLEX_QUEUE_SERIES` | `False` | Auto-queues the *entire remaining series* when Subgen is triggered. |
@@ -251,13 +273,6 @@ Create two separate Webhooks in Tautulli pointing to `http://<your-ip>:9000/taut
 
 ### ⏭️ Skip Logic & Audio Targeting
 *Prevent Subgen from wasting time on files that don't need subtitles.*
-
-**Directory skip marker:** Place an empty `.subgen_skip` file in any directory to tell Subgen to skip that directory and all of its subdirectories — both during the startup scan and when watching for new files. Useful for completed shows or any section of your library that will never need new subtitles.
-```bash
-touch "/tv/The Simpsons/.subgen_skip"   # skips all seasons
-touch "/tv/Some Show/Season 1/.subgen_skip"  # skips just that season
-```
-
 | Variable | Default | Description |
 |---|---|---|
 | `SKIP_IF_TARGET_SUBTITLES_EXIST` | `True` | Skips if an auto-generated subtitle in your desired language already exists. |
@@ -274,7 +289,6 @@ touch "/tv/Some Show/Season 1/.subgen_skip"  # skips just that season
 | `SKIP_UNKNOWN_LANGUAGE` | `False` | Skip processing if Whisper cannot detect the audio language. |
 | `SKIP_ONLY_SUBGEN_SUBTITLES` | `False` | Skips generation only if the file has "subgen" somewhere in the existing subtitle filename. |
 | `SKIP_IF_NO_LANGUAGE_BUT_SUBTITLES_EXIST`| `False` | Skips generation if file doesn't have an audio stream marked with a language, but subtitles exist. |
-| `IGNORE_FORCED_SUBTITLES` | `True` | When `True`, forced embedded subtitle tracks are excluded from all skip-coverage checks. A file whose only matching subtitle tracks are forced will be treated as having no coverage and transcribed normally. Set to `False` to count forced tracks as full coverage (old behaviour). |
 
 ### 📝 Subtitle Formatting & Preferences
 | Variable | Default | Description |
@@ -315,38 +329,6 @@ touch "/tv/Some Show/Season 1/.subgen_skip"  # skips just that season
 
 ## 🌎 Supported Audio Languages (via OpenAI)
 Afrikaans, Arabic, Armenian, Azerbaijani, Belarusian, Bosnian, Bulgarian, Catalan, Chinese, Croatian, Czech, Danish, Dutch, English, Estonian, Finnish, French, Galician, German, Greek, Hebrew, Hindi, Hungarian, Icelandic, Indonesian, Italian, Japanese, Kannada, Kazakh, Korean, Latvian, Lithuanian, Macedonian, Malay, Marathi, Maori, Nepali, Norwegian, Persian, Polish, Portuguese, Romanian, Russian, Serbian, Slovak, Slovenian, Spanish, Swahili, Swedish, Tagalog, Tamil, Thai, Turkish, Ukrainian, Urdu, Vietnamese, and Welsh.
-
----
-
-## 🔗 OpenAI-Compatible API Endpoints
-
-Subgen exposes two endpoints that match the [OpenAI Whisper API](https://platform.openai.com/docs/api-reference/audio), so it can be used as a drop-in backend for any client that targets that API (Open WebUI, Obsidian plugins, etc.).
-
-| Endpoint | Description |
-|---|---|
-| `POST /v1/audio/transcriptions` | Transcribe audio to text in the source language |
-| `POST /v1/audio/translations` | Transcribe and translate audio to English |
-
-**Supported parameters:**
-
-| Parameter | Description |
-|---|---|
-| `file` | Audio file (any format ffmpeg can decode) |
-| `language` | Source language ISO-639-1 code (transcriptions only; auto-detected if omitted) |
-| `prompt` | Optional context passed to Whisper |
-| `response_format` | `json` (default), `text`, `srt`, `vtt`, `verbose_json` |
-| `model` | Accepted but ignored — subgen uses its configured model |
-| `temperature` | Accepted but ignored |
-
-**Example:**
-```bash
-curl -X POST http://<your-ip>:9000/v1/audio/transcriptions \
-  -F "file=@audio.mp3" \
-  -F "response_format=json"
-# {"text": "..."}
-```
-
-`verbose_json` returns segments with start/end timestamps and word-level timestamps.
 
 ---
 

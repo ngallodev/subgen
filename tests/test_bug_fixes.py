@@ -40,11 +40,6 @@ class TestGetSubtitleLanguagesException:
         """Happy path: still returns languages when av.open works."""
         stream = MagicMock()
         stream.metadata = {"language": "eng"}
-        # Make stream.disposition & <anything> return 0 (falsy) so the forced-subtitle
-        # check does not skip this stream. av is fully mocked so we can't use the real
-        # Disposition type — configure __and__ directly instead.
-        stream.disposition = MagicMock()
-        stream.disposition.__and__ = MagicMock(return_value=0)
         container = MagicMock()
         container.__enter__ = MagicMock(return_value=container)
         container.__exit__ = MagicMock(return_value=False)
@@ -182,3 +177,22 @@ class TestTranscribeExistingScoping:
             "Direct file path passed as first entry must be queued even when followed by a directory. "
             "The scoping bug causes it to be checked against the last path (the directory) instead."
         )
+
+
+class TestForcedLanguageStartupScanExtraction:
+    def test_forced_language_path_uses_extracted_startup_scan(self, monkeypatch):
+        calls = []
+
+        monkeypatch.setattr(subgen, "startup_scan_initialize", lambda: calls.append(("initialize",)))
+        monkeypatch.setattr(
+            subgen,
+            "package_forced_startup_scan_existing",
+            lambda *args, **kwargs: calls.append(("forced", args, kwargs)),
+        )
+
+        transcribe_existing("/movies", LanguageCode.ENGLISH)
+
+        assert calls[0] == ("initialize",)
+        assert calls[1][0] == "forced"
+        assert calls[1][1][0] == "/movies"
+        assert calls[1][1][1] == LanguageCode.ENGLISH
