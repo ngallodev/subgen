@@ -62,7 +62,6 @@ from contextlib import asynccontextmanager
 from datetime import datetime
 from functools import lru_cache
 from threading import Event, Lock, Timer
-from types import SimpleNamespace
 from typing import List, Union
 
 import av
@@ -80,10 +79,7 @@ from watchdog.observers.polling import PollingObserver as Observer
 
 from language_code import LanguageCode
 from scan_index import BenchmarkLogger, StartupScanDB, benchmark_step
-from subgen_startup_scan.association import (
-    current_sidecar_state as package_current_sidecar_state,
-    enrich_subtitle_records as package_enrich_subtitle_records,
-)
+from subgen_startup_scan.association import current_sidecar_state
 from subgen_startup_scan.backend import build_startup_scan_backend
 from subgen_startup_scan.classifier import (
     plan_media_record as package_plan_media_record,
@@ -108,15 +104,16 @@ from subgen_startup_scan.legacy import legacy_startup_scan_existing as package_l
 from subgen_startup_scan.policy import startup_scan_policy_signature
 from subgen_startup_scan.runtime import (
     initialize_startup_scan as package_startup_scan_initialize,
-    json_default as package_startup_scan_json_default,
+    json_default,
     refresh_processed_file as package_refresh_processed_file,
-    startup_scan_deserialize_audio_tracks as package_startup_scan_deserialize_audio_tracks,
+    startup_scan_deserialize_audio_tracks,
     startup_scan_get_media_row as package_startup_scan_get_media_row,
-    startup_scan_get_subtitle_rows as package_startup_scan_get_subtitle_rows,
     startup_scan_process_record as package_startup_scan_process_record,
     startup_scan_record_excluded as package_startup_scan_record_excluded,
     startup_scan_record_media as package_startup_scan_record_media,
     startup_scan_record_subtitle as package_startup_scan_record_subtitle,
+    startup_scan_enrich_subtitle_records,
+    startup_scan_probe_cache_info,
 )
 from subgen_startup_scan.service import startup_scan_existing as package_startup_scan_existing
 from subgen_startup_scan.signatures import compute_subtitle_signature as package_compute_subtitle_signature
@@ -416,10 +413,6 @@ SUBTITLE_FILE_EXTENSIONS = {'.srt', '.vtt', '.sub', '.ass', '.ssa', '.idx', '.sb
 IGNORED_SCAN_DIR_NAMES = {'.git', '.hg', '.svn', '.idea', '__pycache__', 'lost+found'}
 
 
-def _startup_scan_probe_cache_info():
-    return SimpleNamespace(hits=0, misses=0, currsize=0, maxsize=0)
-
-
 def _safe_file_mtime(file_path: str) -> int:
     try:
         return int(os.path.getmtime(file_path))
@@ -445,10 +438,6 @@ def _startup_scan_now() -> int:
 
 def _startup_scan_get_media_row(conn, path: str):
     return package_startup_scan_get_media_row(conn, path)
-
-
-def _startup_scan_get_subtitle_rows(conn, media_path: str):
-    return package_startup_scan_get_subtitle_rows(conn, media_path)
 
 
 def _startup_scan_record_media(conn, path: str, size: int, mtime: int, has_audio: bool, audio_language, subtitle_state: str, decision: str, reason: str, last_seen: int) -> None:
@@ -493,29 +482,6 @@ def _startup_scan_refresh_processed_file(path: str, transcription_type: str, for
     )
 
 
-def _startup_scan_current_sidecar_state(subtitle_rows: list[dict]) -> str:
-    return package_current_sidecar_state(subtitle_rows)
-
-
-def _startup_scan_json_default(value):
-    return package_startup_scan_json_default(value, language_code=LanguageCode)
-
-
-def _startup_scan_deserialize_audio_tracks(audio_tracks_json: str | None):
-    return package_startup_scan_deserialize_audio_tracks(
-        audio_tracks_json,
-        language_code=LanguageCode,
-    )
-
-
-def _startup_scan_enrich_subtitle_records(subtitle_records: list[dict], media_index: dict):
-    package_enrich_subtitle_records(
-        subtitle_records,
-        media_index,
-        from_string=LanguageCode.from_string,
-    )
-
-
 def _startup_scan_collect_records(root_path: str):
     return package_startup_scan_collect_records(
         root_path,
@@ -524,7 +490,7 @@ def _startup_scan_collect_records(root_path: str):
         is_subtitle_file_name=is_subtitle_file_extension,
         has_video_extension=has_video_extension,
         has_audio_extension=has_audio_extension,
-        enrich_subtitle_records=_startup_scan_enrich_subtitle_records,
+        enrich_subtitle_records=startup_scan_enrich_subtitle_records,
     )
 
 
@@ -621,8 +587,8 @@ def collect_startup_inventory(root_paths, recursive: bool = False, db: StartupSc
         db=db,
         has_video_extension=has_video_extension,
         has_audio_extension=has_audio_extension,
-        enrich_subtitle_records=_startup_scan_enrich_subtitle_records,
-        json_default=_startup_scan_json_default,
+        enrich_subtitle_records=startup_scan_enrich_subtitle_records,
+        json_default=json_default,
     )
 
 
@@ -755,9 +721,9 @@ def _build_startup_scan_dependencies() -> StartupScanDependencies:
         observer_factory=Observer,
         new_file_handler_factory=NewFileHandler,
         path_mapping=path_mapping,
-        current_sidecar_state=_startup_scan_current_sidecar_state,
-        deserialize_audio_tracks=_startup_scan_deserialize_audio_tracks,
-        json_default=_startup_scan_json_default,
+        current_sidecar_state=current_sidecar_state,
+        deserialize_audio_tracks=startup_scan_deserialize_audio_tracks,
+        json_default=json_default,
         gen_subtitles_queue=gen_subtitles_queue,
         collect_startup_inventory=collect_startup_inventory,
         compute_subtitle_signature=compute_subtitle_signature,
@@ -765,7 +731,7 @@ def _build_startup_scan_dependencies() -> StartupScanDependencies:
         inventory_signature_matches=_startup_scan_inventory_signature_matches,
         store_inventory_signature=_startup_scan_store_inventory_signature,
         get_startup_policy_signature=get_startup_policy_signature,
-        probe_cache_info=_startup_scan_probe_cache_info,
+        probe_cache_info=startup_scan_probe_cache_info,
         benchmark_logger_factory=BenchmarkLogger,
         benchmark_step=benchmark_step,
         startup_scan_db_factory=StartupScanDB,

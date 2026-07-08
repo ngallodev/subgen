@@ -2,8 +2,23 @@ import json
 import logging
 import os
 import time
+from types import SimpleNamespace
 
 from .association import current_sidecar_state
+from .association import enrich_subtitle_records
+from language_code import LanguageCode
+
+
+def startup_scan_probe_cache_info():
+    return SimpleNamespace(hits=0, misses=0, currsize=0, maxsize=0)
+
+
+def startup_scan_enrich_subtitle_records(subtitle_records: list[dict], media_index: dict):
+    enrich_subtitle_records(
+        subtitle_records,
+        media_index,
+        from_string=LanguageCode.from_string,
+    )
 
 
 def startup_scan_now() -> int:

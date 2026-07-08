@@ -262,14 +262,16 @@ Create two separate Webhooks in Tautulli pointing to `http://<your-ip>:9000/taut
 | `MONITOR` | `False` | Actively watches `TRANSCRIBE_FOLDERS` in real-time for newly pasted files. |
 | `STARTUP_SCAN_BACKEND` | `legacy` | Selects startup scan behavior. Use `legacy` for the stock recursive scan path or `persistent` for the SQLite-backed cached scanner. |
 | `STARTUP_SCAN_DB_PATH` | `/subgen/state/subgen_scan.db` | SQLite cache for startup scan state, excluded files, and subtitle inventory. |
-| `STARTUP_SCAN_BENCHMARK_LOGGING` | `False` | Opt-in startup scan timing. When enabled, writes structured JSONL timing records to the configured benchmark log path. |
+| `STARTUP_SCAN_BENCHMARK_LOGGING` | `False` | Off by default. When enabled, writes structured JSONL timing records to the configured benchmark log path. |
 | `STARTUP_SCAN_BENCHMARK_LOG_PATH` | `/subgen/state/startup_scan_benchmarks.jsonl` | Host-mounted log file for benchmark output. |
-| `STARTUP_SCAN_PLANNER_TRACE_LOGGING` | `False` | Adds opt-in planner sub-step timings for startup scan classification and queue decisions. |
+| `STARTUP_SCAN_PLANNER_TRACE_LOGGING` | `False` | Off by default. When enabled, adds planner sub-step timings for startup scan classification and queue decisions. |
 | `STARTUP_SCAN_MONITOR_ASYNC_START` | `True` | Starts the recursive monitor in the background so warm startup does not block on watcher initialization. |
 | `PLEX_QUEUE_NEXT_EPISODE` | `False` | Auto-queues the *next* Plex episode when Subgen is triggered. |
 | `PLEX_QUEUE_SEASON` | `False` | Auto-queues the *entire remaining season* when Subgen is triggered. |
 | `PLEX_QUEUE_SERIES` | `False` | Auto-queues the *entire remaining series* when Subgen is triggered. |
 | `WEBHOOK_URL_COMPLETED` | `''` | Sends a POST to the `WEBHOOK_URL_COMPLETED` URL with a JSON containing: <br><code>{<br>&nbsp;&nbsp;"event": "transcribed",<br>&nbsp;&nbsp;"file": "/absolute/path/to/video.mkv",<br>&nbsp;&nbsp;"subtitle": "/absolute/path/to/video.en.srt",<br>&nbsp;&nbsp;"language": "en"<br>}</code><br>It will not fire on skips, `/asr` or `/detect-language`. |
+
+For the persistent startup-scan backend internals, schema, ERD, data flow, and benchmark notes, see [subgen_startup_scan/README.md](subgen_startup_scan/README.md).
 
 ### ⏭️ Skip Logic & Audio Targeting
 *Prevent Subgen from wasting time on files that don't need subtitles.*
