@@ -1,5 +1,5 @@
 from .backend import StartupScanBackend, build_startup_scan_backend
-from .benchmarks import BENCHMARK_LOGGING_ENABLED, BENCHMARK_LOG_PATH, BenchmarkLogger, benchmark_step
+from .benchmarks import BenchmarkLogger, benchmark_step
 from .config import get_startup_scan_backend_name
 from .db import StartupScanDB
 from .dependencies import StartupScanDependencies
@@ -39,3 +39,15 @@ __all__ = [
     "startup_scan_inventory_signature_matches",
     "startup_scan_store_inventory_signature",
 ]
+
+
+def __getattr__(name: str):
+    if name == "BENCHMARK_LOGGING_ENABLED":
+        from .config import get_startup_scan_benchmark_logging
+
+        return get_startup_scan_benchmark_logging()
+    if name == "BENCHMARK_LOG_PATH":
+        from .config import get_startup_scan_benchmark_log_path
+
+        return get_startup_scan_benchmark_log_path()
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
