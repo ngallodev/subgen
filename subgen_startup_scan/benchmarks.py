@@ -9,9 +9,12 @@ from typing import Any
 
 from .config import get_startup_scan_benchmark_log_path, get_startup_scan_benchmark_logging
 
-
-BENCHMARK_LOG_PATH = get_startup_scan_benchmark_log_path()
-BENCHMARK_LOGGING_ENABLED = get_startup_scan_benchmark_logging()
+def __getattr__(name: str):
+    if name == "BENCHMARK_LOG_PATH":
+        return get_startup_scan_benchmark_log_path()
+    if name == "BENCHMARK_LOGGING_ENABLED":
+        return get_startup_scan_benchmark_logging()
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
 class BenchmarkLogger:
