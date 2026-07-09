@@ -20,6 +20,49 @@ def cached_entries_signature(cached_state: dict, child_dirs: list[str], media_re
     )
 
 
+def deserialize_directory_state(cached_state: dict) -> tuple[list[str], list[dict], list[dict]]:
+    return (
+        json.loads(cached_state.get("child_dirs_json") or "[]"),
+        json.loads(cached_state.get("media_files_json") or "[]"),
+        json.loads(cached_state.get("subtitle_files_json") or "[]"),
+    )
+
+
+def build_directory_state_payload(
+    *,
+    path: str,
+    stat_result,
+    child_dirs: list[str],
+    media_records: list[dict],
+    subtitle_records: list[dict],
+    subtree_inventory_json: str,
+    json_default,
+) -> dict:
+    entries_signature = directory_entries_signature(
+        child_dirs,
+        [record.get("name") or os.path.basename(record["path"]) for record in media_records + subtitle_records],
+    )
+    return {
+        "path": path,
+        "size": stat_result.st_size,
+        "mtime": int(stat_result.st_mtime),
+        "child_dirs_json": json.dumps(child_dirs),
+        "media_files_json": json.dumps(media_records, default=json_default),
+        "subtitle_files_json": json.dumps(subtitle_records, default=json_default),
+        "entries_signature": entries_signature,
+        "subtree_inventory_json": subtree_inventory_json,
+    }
+
+
+def store_directory_state(db, payload: dict) -> None:
+    db.upsert_directory_state(**payload)
+
+
+def update_directory_state_cache(directory_state_cache: dict | None, payload: dict) -> None:
+    if directory_state_cache is not None:
+        directory_state_cache[payload["path"]] = payload
+
+
 def path_is_under_root(path: str, root_path: str) -> bool:
     normalized_path = os.path.normcase(path)
     normalized_root = os.path.normcase(root_path)
