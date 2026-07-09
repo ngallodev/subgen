@@ -15,8 +15,55 @@ Constraints followed in this artifact:
 ## Code Under Test
 
 - branch: `codex/reapply-backend-seam`
-- benchmark commit: `55bebbf`
+- benchmark commit: `dfea2b3`
 - benchmarked app version in container logs: `2026.06.6`
+
+## Current PR Slice
+
+This slice keeps the startup-scan seam intact and adds a pre-audio skip fast path:
+
+- when startup inventory already provides subtitle rows, planner skip checks can run before `get_audio_tracks()`
+- fallback behavior stays unchanged when startup inventory context is absent
+- planner-detail telemetry format is unchanged
+
+### Subset cold progression
+
+Cold subset runs are compared across the three on-disk snapshots:
+
+| Scenario | `startup_scan.inventory` | `startup_scan.classify_media.parallel_plan` | `startup_scan.classify_media.parallel_plan_detail.audio_tracks_ms_total_ms` | `startup_scan.classify_media.parallel_plan_detail.skip_check_ms_total_ms` | `startup_scan.classify_media.parallel_plan_detail.queue_plan_total_ms` | `startup_scan.classify_media` | `startup_scan.monitor_setup` | `startup_scan.total` |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| `bench-nzb-v3-cold.jsonl` | 44085.243 ms | 90505.692 ms | 279263.915 ms | 65644.277 ms | 344909.220 ms | 90727.381 ms | 34.638 ms | 135734.736 ms |
+| `bench-nzb-v4-cold.jsonl` | 48286.877 ms | 89970.519 ms | 340542.141 ms | 8.803 ms | 340551.935 ms | 90240.619 ms | 20.584 ms | 140393.497 ms |
+| `bench-nzb-v5-cold.jsonl` | 16152.210 ms | 10.985 ms | 0.000 ms | 30.691 ms | 31.057 ms | 254.011 ms | 27.642 ms | 17924.375 ms |
+
+Takeaways:
+
+- the v5 cold slice collapses planner work by short-circuiting skips before audio probing
+- `startup_scan.classify_media.parallel_plan_detail.audio_tracks_ms_total_ms` is now `0.000 ms` on the latest cold run
+- total cold startup on this subset dropped from `140393.497 ms` in v4 to `17924.375 ms` in v5
+
+### Fresh warm rerun after this restart
+
+The current warm subset snapshot is `bench-nzb-v5-warm.jsonl`:
+
+| Scenario | `startup_scan.inventory` | `startup_scan.subtitle_relink` | `startup_scan.monitor_setup` | `startup_scan.total` |
+| --- | ---: | ---: | ---: | ---: |
+| Fresh warm rerun after this restart | 407.284 ms | 4.180 ms | 4.016 ms | 646.011 ms |
+| Existing warm reference `bench-nzb-v2-warm.jsonl` | 322.967 ms | n/a | 12.476 ms | 1670.380 ms |
+
+The current warm snapshot is the one to cite for this PR:
+
+- warm `total` is `646.011 ms`
+- warm `subtitle_relink` is `4.180 ms`
+- warm `monitor_setup` is `4.016 ms`
+
+### Full-library warm reference
+
+The broad warm reference still on disk remains useful as a regression guardrail, but it is not directly comparable to the 33-file subset:
+
+| Scenario | `startup_scan.inventory` | `startup_scan.subtitle_relink` | `startup_scan.monitor_setup` | `startup_scan.total` |
+| --- | ---: | ---: | ---: | ---: |
+| Existing full-library warm reference `bench-full-warm.jsonl` | 1949.813 ms | 473.110 ms | 102.183 ms | 6826.118 ms |
 
 ## Benchmark Method
 
