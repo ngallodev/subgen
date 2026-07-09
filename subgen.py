@@ -494,8 +494,126 @@ def _startup_scan_collect_records(root_path: str):
     )
 
 
-def describe_skip_reason(file_path: str, target_language: LanguageCode, audio_langs=None):
-    skipped = should_skip_file(file_path, target_language, audio_langs=audio_langs)
+def _subtitle_row_language_matches(subtitle_row: dict, target_language: LanguageCode) -> bool:
+    language = subtitle_row.get("language")
+    if not language:
+        return False
+    return LanguageCode.from_string(language) == target_language
+
+
+def _known_external_subtitle_exists(
+    subtitle_rows: list[dict] | None,
+    target_language: LanguageCode,
+    *,
+    only_match_subgen_subtitles: bool = False,
+) -> bool:
+    if not subtitle_rows:
+        return False
+    for subtitle_row in subtitle_rows:
+        has_subgen = subtitle_row.get("subtitle_type") == "generated"
+        if target_language == LanguageCode.NONE:
+            if only_match_subgen_subtitles and not has_subgen:
+                continue
+            return True
+        if _subtitle_row_language_matches(subtitle_row, target_language):
+            if only_match_subgen_subtitles and not has_subgen:
+                continue
+            return True
+    return False
+
+
+def _known_output_path_exists(expected_output: str, subtitle_rows: list[dict] | None) -> bool:
+    if not subtitle_rows:
+        return False
+    return any(row.get("path") == expected_output for row in subtitle_rows)
+
+
+def describe_skip_reason_pre_audio(
+    file_path: str,
+    target_language: LanguageCode,
+    subtitle_rows=None,
+    current_sidecar_state=None,
+):
+    del current_sidecar_state
+
+    subtitle_rows = subtitle_rows or []
+    base_name = os.path.basename(file_path)
+    file_name, file_ext = os.path.splitext(base_name)
+
+    if transcribe_or_translate == 'translate':
+        target_language = LanguageCode.ENGLISH
+
+    if is_audio_file_extension(file_ext) and lrc_for_audio_files:
+        lrc_path = os.path.join(os.path.dirname(file_path), f"{file_name}.lrc")
+        if os.path.exists(lrc_path):
+            logging.info(f"Skipping {base_name}: LRC file already exists.")
+            return True, "skipped", "Skipped by should_skip_file."
+
+    named_output_configured = subtitle_language_name and LanguageCode.is_valid_language(subtitle_language_name)
+    external_lang = LanguageCode.from_string(subtitle_language_name) if named_output_configured else LanguageCode.NONE
+
+    if target_language == LanguageCode.NONE:
+        if skip_unknown_language:
+            logging.info(f"Skipping {base_name}: Audio language unknown and SKIP_UNKNOWN_LANGUAGE is enabled.")
+            return True, "skipped", "Skipped by should_skip_file."
+        if skip_if_no_audio_language_but_subtitles_exist and subtitle_rows:
+            logging.info(f"Skipping {base_name}: Audio language unknown but subtitles already exist.")
+            return True, "skipped", "Skipped by should_skip_file."
+
+    if subtitle_rows and skip_if_target_subtitle_exists:
+        if named_output_configured and _known_external_subtitle_exists(
+            subtitle_rows,
+            external_lang,
+            only_match_subgen_subtitles=only_match_subgen_subtitles,
+        ):
+            logging.info(f"Skipping {base_name}: Subtitles already exist in custom name '{subtitle_language_name}'.")
+            return True, "skipped", "Skipped by should_skip_file."
+
+        if not (target_language == LanguageCode.NONE and named_output_configured):
+            if _known_external_subtitle_exists(
+                subtitle_rows,
+                target_language,
+                only_match_subgen_subtitles=only_match_subgen_subtitles,
+            ):
+                if target_language == LanguageCode.NONE:
+                    logging.info(f"Skipping {base_name}: Subtitles already exist and audio language could not be detected from file metadata.")
+                else:
+                    lang_name = target_language.to_name()
+                    logging.info(f"Skipping {base_name}: Subtitles already exist in {lang_name}.")
+                return True, "skipped", "Skipped by should_skip_file."
+
+        expected_output = name_subtitle(file_path, target_language)
+        if _known_output_path_exists(expected_output, subtitle_rows):
+            logging.info(f"Skipping {base_name}: Generated subtitle '{os.path.basename(expected_output)}' already exists.")
+            return True, "skipped", "Skipped by should_skip_file."
+
+    if subtitle_rows and skip_if_external_sub_exists and named_output_configured:
+        if _known_external_subtitle_exists(
+            subtitle_rows,
+            external_lang,
+            only_match_subgen_subtitles=only_match_subgen_subtitles,
+        ):
+            lang_name = external_lang.to_name()
+            logging.info(f"Skipping {base_name}: External subtitles in {lang_name} already exist.")
+            return True, "skipped", "Skipped by should_skip_file."
+
+    return False, None, None
+
+
+def describe_skip_reason(
+    file_path: str,
+    target_language: LanguageCode,
+    audio_langs=None,
+    subtitle_rows=None,
+    current_sidecar_state=None,
+):
+    skipped = should_skip_file(
+        file_path,
+        target_language,
+        audio_langs=audio_langs,
+        subtitle_rows=subtitle_rows,
+        current_sidecar_state=current_sidecar_state,
+    )
     if not skipped:
         return False, None, None
     return True, "skipped", "Skipped by should_skip_file."
@@ -708,7 +826,9 @@ def _build_startup_scan_dependencies() -> StartupScanDependencies:
         has_audio=has_audio,
         get_audio_tracks=get_audio_tracks,
         choose_transcribe_language=choose_transcribe_language,
+        describe_skip_reason_pre_audio=describe_skip_reason_pre_audio,
         describe_skip_reason=describe_skip_reason,
+        describe_skip_reason_with_context=describe_skip_reason,
         should_whisper_detect_audio_language=should_whisper_detect_audio_language,
         startup_scan_planner_trace_logging=startup_scan_planner_trace_logging,
         startup_scan_force_rewalk=startup_scan_force_rewalk,
@@ -2386,7 +2506,13 @@ def gen_subtitles_queue(file_path: str, transcription_type: str, force_language:
 
     task_queue.put(task)
 
-def should_skip_file(file_path: str, target_language: LanguageCode, audio_langs=None) -> bool:
+def should_skip_file(
+    file_path: str,
+    target_language: LanguageCode,
+    audio_langs=None,
+    subtitle_rows=None,
+    current_sidecar_state=None,
+) -> bool:
     """
     Determines if subtitle generation should be skipped for a file.
 
@@ -2398,8 +2524,11 @@ def should_skip_file(file_path: str, target_language: LanguageCode, audio_langs=
     Returns:
         True if the file should be skipped, False otherwise.
     """
+    del current_sidecar_state
+
     base_name = os.path.basename(file_path)
     file_name, file_ext = os.path.splitext(base_name)
+    subtitle_rows = subtitle_rows or []
     if transcribe_or_translate == 'translate':
         target_language = LanguageCode.ENGLISH  # Force our target language as english if we are translating
 
@@ -2437,12 +2566,33 @@ def should_skip_file(file_path: str, target_language: LanguageCode, audio_langs=
 
     # 4. Skip if a subtitle already exists in the target language.
     if skip_if_target_subtitle_exists:
+        named_output_configured = subtitle_language_name and LanguageCode.is_valid_language(subtitle_language_name)
+        external_lang = LanguageCode.from_string(subtitle_language_name) if named_output_configured else LanguageCode.NONE
+
+        if subtitle_rows and named_output_configured:
+            if _known_external_subtitle_exists(
+                subtitle_rows,
+                external_lang,
+                only_match_subgen_subtitles=only_match_subgen_subtitles,
+            ):
+                logging.info(f"Skipping {base_name}: Subtitles already exist in custom name '{subtitle_language_name}'.")
+                return True
+
         # When audio language is unknown but SUBTITLE_LANGUAGE_NAME is explicitly set, we know
         # exactly what file we intend to write — skip the generic "any subtitle → skip" check
         # and only look for the specifically named output below.
-        named_output_configured = subtitle_language_name and LanguageCode.is_valid_language(subtitle_language_name)
         if not (target_language == LanguageCode.NONE and named_output_configured):
-            if subtitle_exists_in_language(file_path, target_language):
+            if subtitle_rows:
+                has_matching_subtitle = _known_external_subtitle_exists(
+                    subtitle_rows,
+                    target_language,
+                    only_match_subgen_subtitles=only_match_subgen_subtitles,
+                )
+                if not has_matching_subtitle:
+                    has_matching_subtitle = has_internal_subtitle_in_language(file_path, target_language)
+            else:
+                has_matching_subtitle = subtitle_exists_in_language(file_path, target_language)
+            if has_matching_subtitle:
                 if target_language == LanguageCode.NONE:
                     logging.info(f"Skipping {base_name}: Subtitles already exist and audio language could not be detected from file metadata.")
                 else:
@@ -2452,14 +2602,27 @@ def should_skip_file(file_path: str, target_language: LanguageCode, audio_langs=
 
         # Since SUBTITLE_LANGUAGE_NAME overrides the output filename, check if it exists in the folder.
         if named_output_configured:
-            external_lang = LanguageCode.from_string(subtitle_language_name)
-            if has_external_subtitle_in_language(file_path, external_lang, recursion=True, only_match_subgen_subtitles=only_match_subgen_subtitles):
+            has_named_external_subtitle = (
+                _known_external_subtitle_exists(
+                    subtitle_rows,
+                    external_lang,
+                    only_match_subgen_subtitles=only_match_subgen_subtitles,
+                )
+                if subtitle_rows
+                else has_external_subtitle_in_language(
+                    file_path,
+                    external_lang,
+                    recursion=True,
+                    only_match_subgen_subtitles=only_match_subgen_subtitles,
+                )
+            )
+            if has_named_external_subtitle:
                 logging.info(f"Skipping {base_name}: Subtitles already exist in custom name '{subtitle_language_name}'.")
                 return True
 
         # Check: Does the exact file Subgen intends to create already exist?
         expected_output = name_subtitle(file_path, target_language)
-        if os.path.exists(expected_output):
+        if _known_output_path_exists(expected_output, subtitle_rows) or os.path.exists(expected_output):
             logging.info(f"Skipping {base_name}: Generated subtitle '{os.path.basename(expected_output)}' already exists.")
             return True
 
@@ -2481,7 +2644,21 @@ def should_skip_file(file_path: str, target_language: LanguageCode, audio_langs=
     #    it only adds distinct behaviour when skip_if_target_subtitle_exists is False.
     if skip_if_external_sub_exists and subtitle_language_name and LanguageCode.is_valid_language(subtitle_language_name):
         external_lang = LanguageCode.from_string(subtitle_language_name)
-        if has_external_subtitle_in_language(file_path, external_lang, recursion=True, only_match_subgen_subtitles=only_match_subgen_subtitles):
+        has_named_external_subtitle = (
+            _known_external_subtitle_exists(
+                subtitle_rows,
+                external_lang,
+                only_match_subgen_subtitles=only_match_subgen_subtitles,
+            )
+            if subtitle_rows
+            else has_external_subtitle_in_language(
+                file_path,
+                external_lang,
+                recursion=True,
+                only_match_subgen_subtitles=only_match_subgen_subtitles,
+            )
+        )
+        if has_named_external_subtitle:
             lang_name = external_lang.to_name()
             logging.info(f"Skipping {base_name}: External subtitles in {lang_name} already exist.")
             return True
