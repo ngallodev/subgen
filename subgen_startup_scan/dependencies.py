@@ -13,7 +13,9 @@ class StartupScanDependencies:
     has_audio: Callable[[str], bool] | None = None
     get_audio_tracks: Callable[[str], list[dict[str, Any]]] | None = None
     choose_transcribe_language: Callable[..., Any] | None = None
+    describe_skip_reason_pre_audio: Callable[..., tuple[bool, str, str]] | None = None
     describe_skip_reason: Callable[..., tuple[bool, str, str]] | None = None
+    describe_skip_reason_with_context: Callable[..., tuple[bool, str, str]] | None = None
     should_whisper_detect_audio_language: bool = False
     startup_scan_planner_trace_logging: bool = False
     startup_scan_force_rewalk: bool = False

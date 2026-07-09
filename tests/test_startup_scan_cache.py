@@ -941,6 +941,110 @@ def test_plan_media_record_keeps_signature_for_queue_paths(monkeypatch):
     assert calls == [("signature", "/media/movie.mkv")]
 
 
+def test_plan_media_record_reuses_known_subtitle_rows_for_skip_checks(monkeypatch):
+    monkeypatch.setattr(subgen, "transcribe_or_translate", "transcribe")
+    monkeypatch.setattr(subgen, "lrc_for_audio_files", True)
+    monkeypatch.setattr(subgen, "skip_unknown_language", False)
+    monkeypatch.setattr(subgen, "skip_if_target_subtitle_exists", True)
+    monkeypatch.setattr(subgen, "skip_if_internal_sub_language", LanguageCode.NONE)
+    monkeypatch.setattr(subgen, "skip_if_external_sub_exists", False)
+    monkeypatch.setattr(subgen, "subtitle_language_name", "")
+    monkeypatch.setattr(subgen, "skip_subtitle_languages", [])
+    monkeypatch.setattr(subgen, "limit_to_preferred_audio_languages", False)
+    monkeypatch.setattr(subgen, "preferred_audio_languages", [LanguageCode.ENGLISH])
+    monkeypatch.setattr(subgen, "skip_audio_languages", [])
+    monkeypatch.setattr(subgen, "only_match_subgen_subtitles", False)
+    monkeypatch.setattr(subgen, "skip_if_no_audio_language_but_subtitles_exist", False)
+    monkeypatch.setattr(subgen, "has_internal_subtitle_in_language", lambda path, lang: False)
+    monkeypatch.setattr(
+        subgen,
+        "has_external_subtitle_in_language",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("external subtitle scan should not run")),
+    )
+
+    deps = StartupScanDependencies(
+        task_queue=type("Queue", (), {"is_active": staticmethod(lambda path: False)})(),
+        language_code=LanguageCode,
+        get_audio_tracks=lambda path: [{"language": LanguageCode.ENGLISH}],
+        choose_transcribe_language=lambda file_path, force_language, audio_tracks=None: LanguageCode.ENGLISH,
+        describe_skip_reason=subgen.describe_skip_reason,
+        describe_skip_reason_with_context=subgen.describe_skip_reason,
+        should_whisper_detect_audio_language=False,
+        transcribe_or_translate="transcribe",
+        deserialize_audio_tracks=lambda value: [],
+        compute_subtitle_signature=lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("signature should not run")),
+    )
+
+    result = package_plan_media_record(
+        deps,
+        {"path": "/media/movie.mkv", "size": 1, "mtime": 2},
+        "/media/movie.mkv",
+        None,
+        object(),
+        [
+            {
+                "path": "/media/movie.eng.srt",
+                "language": "eng",
+                "subtitle_type": "external",
+            }
+        ],
+        "external",
+    )
+
+    assert result["plan"]["status"] == "skip"
+    assert result["subtitle_signature"] == ""
+
+
+def test_plan_media_record_skips_before_audio_probe_when_known_subtitles_cover_output(monkeypatch):
+    monkeypatch.setattr(subgen, "transcribe_or_translate", "transcribe")
+    monkeypatch.setattr(subgen, "lrc_for_audio_files", True)
+    monkeypatch.setattr(subgen, "skip_unknown_language", False)
+    monkeypatch.setattr(subgen, "skip_if_target_subtitle_exists", True)
+    monkeypatch.setattr(subgen, "skip_if_internal_sub_language", LanguageCode.NONE)
+    monkeypatch.setattr(subgen, "skip_if_external_sub_exists", False)
+    monkeypatch.setattr(subgen, "subtitle_language_name", "aa")
+    monkeypatch.setattr(subgen, "skip_subtitle_languages", [])
+    monkeypatch.setattr(subgen, "limit_to_preferred_audio_languages", False)
+    monkeypatch.setattr(subgen, "preferred_audio_languages", [LanguageCode.ENGLISH])
+    monkeypatch.setattr(subgen, "skip_audio_languages", [])
+    monkeypatch.setattr(subgen, "only_match_subgen_subtitles", False)
+    monkeypatch.setattr(subgen, "skip_if_no_audio_language_but_subtitles_exist", False)
+
+    deps = StartupScanDependencies(
+        task_queue=type("Queue", (), {"is_active": staticmethod(lambda path: False)})(),
+        language_code=LanguageCode,
+        get_audio_tracks=lambda path: (_ for _ in ()).throw(AssertionError("audio probe should not run")),
+        choose_transcribe_language=lambda file_path, force_language, audio_tracks=None: force_language,
+        describe_skip_reason_pre_audio=subgen.describe_skip_reason_pre_audio,
+        describe_skip_reason=subgen.describe_skip_reason,
+        describe_skip_reason_with_context=subgen.describe_skip_reason,
+        should_whisper_detect_audio_language=False,
+        transcribe_or_translate="transcribe",
+        deserialize_audio_tracks=lambda value: [],
+        compute_subtitle_signature=lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("signature should not run")),
+    )
+
+    result = package_plan_media_record(
+        deps,
+        {"path": "/media/movie.mkv", "size": 1, "mtime": 2},
+        "/media/movie.mkv",
+        None,
+        object(),
+        [
+            {
+                "path": "/media/movie.subgen.large-v3.aa.srt",
+                "language": "aar",
+                "subtitle_type": "generated",
+            }
+        ],
+        "generated",
+    )
+
+    assert result["plan"]["status"] == "skip"
+    assert result["plan"]["reason"] == "skipped"
+    assert result["subtitle_signature"] == ""
+
+
 def test_benchmark_logger_respects_env_toggle(tmp_path):
     from scan_index import BenchmarkLogger
 
