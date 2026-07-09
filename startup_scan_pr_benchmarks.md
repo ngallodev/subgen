@@ -253,6 +253,40 @@ Interpretation:
 - the previous `has_audio()` probe cost has effectively been eliminated from this path
 - the next cold-start target is now `describe_skip_reason()` / skip-check work, with `get_audio_tracks()` still the largest remaining probe slice
 
+## Stock Vs Current Wall-Clock Comparison
+
+To compare against original `subgen-stock`, both repos were run against the same live subset under `/movies/downloads/nzb` using the same wall-clock method:
+
+- start: startup-scan start log line
+- end: startup-scan completion log line
+- this comparison uses external elapsed time, not the internal `startup_scan.*` JSONL timings
+
+Measured wall-clock results:
+
+| Repo | Phase | Wall-clock |
+| --- | --- | ---: |
+| `subgen-stock` | cold | 166000 ms |
+| `subgen-stock` | warm | 170000 ms |
+| current persistent backend | cold | 26000 ms |
+| current persistent backend | warm | 18000 ms |
+
+Takeaways:
+
+- current persistent cold is about `6.4x` faster than `subgen-stock` cold on this live subset
+- current persistent warm is about `9.4x` faster than `subgen-stock` warm on this live subset
+- `subgen-stock` showed effectively no warm-start benefit on this path:
+  - cold: `166000 ms`
+  - warm: `170000 ms`
+- current persistent startup did retain a meaningful warm-start benefit:
+  - cold: `26000 ms`
+  - warm: `18000 ms`
+
+Important context:
+
+- this live `/movies/downloads/nzb` subset is larger than the earlier sanitized 33-file `Subset A`
+- these numbers should therefore be treated as a newer apples-to-apples stock-vs-current comparison, not a direct replacement for the older `Subset A` internal benchmark tables
+- during the stock runs, logs showed repeated internal subtitle probing while walking the subset; the current persistent path completed substantially faster on the same mounted library
+
 ## Follow-Up Benchmark Recommendations
 
 Recommended additions for later benchmark updates:
