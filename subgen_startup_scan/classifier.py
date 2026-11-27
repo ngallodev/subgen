@@ -31,6 +31,7 @@ def prepare_media_queue_job(
     file_path: str,
     transcription_type: str,
     force_language: Any,
+    force: bool = False,
     audio_tracks=None,
     subtitle_rows=None,
     current_sidecar_state: str | None = None,
@@ -40,11 +41,11 @@ def prepare_media_queue_job(
     metadata_kwargs = {
         key: value
         for key, value in task_kwargs.items()
-        if key not in {"path", "type", "transcribe_or_translate", "force_language", "audio_tracks"}
+        if key not in {"path", "type", "transcribe_or_translate", "force_language", "audio_tracks", "force"}
     }
 
     started_at = time.perf_counter()
-    if deps.task_queue.is_active(file_path):
+    if not force and deps.task_queue.is_active(file_path):
         if trace is not None:
             trace["active_check_ms"] = (time.perf_counter() - started_at) * 1000
         return {
@@ -56,7 +57,7 @@ def prepare_media_queue_job(
     if trace is not None:
         trace["active_check_ms"] = (time.perf_counter() - started_at) * 1000
 
-    if deps.describe_skip_reason_pre_audio:
+    if not force and deps.describe_skip_reason_pre_audio:
         started_at = time.perf_counter()
         skipped, skip_reason, skip_details = deps.describe_skip_reason_pre_audio(
             file_path,
@@ -151,33 +152,34 @@ def prepare_media_queue_job(
     if trace is not None:
         trace["choose_language_ms"] = (time.perf_counter() - started_at) * 1000
 
-    started_at = time.perf_counter()
-    if deps.describe_skip_reason_with_context:
-        skipped, skip_reason, skip_details = deps.describe_skip_reason_with_context(
-            file_path,
-            force_language,
-            audio_langs=audio_langs,
-            subtitle_rows=subtitle_rows,
-            current_sidecar_state=current_sidecar_state,
-        )
-    else:
-        skipped, skip_reason, skip_details = deps.describe_skip_reason(
-            file_path,
-            force_language,
-            audio_langs=audio_langs,
-        )
-    if trace is not None:
-        trace["skip_check_ms"] = (time.perf_counter() - started_at) * 1000
-    if skipped:
-        return {
-            "status": "skip",
-            "reason": skip_reason,
-            "details": skip_details,
-            "force_language": force_language,
-            "audio_tracks": audio_tracks,
-            "audio_langs": audio_langs,
-            "planner_trace": trace,
-        }
+    if not force:
+        started_at = time.perf_counter()
+        if deps.describe_skip_reason_with_context:
+            skipped, skip_reason, skip_details = deps.describe_skip_reason_with_context(
+                file_path,
+                force_language,
+                audio_langs=audio_langs,
+                subtitle_rows=subtitle_rows,
+                current_sidecar_state=current_sidecar_state,
+            )
+        else:
+            skipped, skip_reason, skip_details = deps.describe_skip_reason(
+                file_path,
+                force_language,
+                audio_langs=audio_langs,
+            )
+        if trace is not None:
+            trace["skip_check_ms"] = (time.perf_counter() - started_at) * 1000
+        if skipped:
+            return {
+                "status": "skip",
+                "reason": skip_reason,
+                "details": skip_details,
+                "force_language": force_language,
+                "audio_tracks": audio_tracks,
+                "audio_langs": audio_langs,
+                "planner_trace": trace,
+            }
 
     started_at = time.perf_counter()
     if not force_language and deps.should_whisper_detect_audio_language:

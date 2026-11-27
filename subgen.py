@@ -432,10 +432,10 @@ class DeduplicatedQueue(queue.PriorityQueue):
         if get_startup_scan_backend_name(default="legacy") == "persistent":
             self._durable = DurableJobStore(startup_scan_db_path + ".jobs")
 
-    def put(self, item, block=True, timeout=None):
-        return self.put_with_result(item, block=block, timeout=timeout)["queued"]
+    def put(self, item, block=True, timeout=None, force=False):
+        return self.put_with_result(item, block=block, timeout=timeout, force=force)["queued"]
 
-    def put_with_result(self, item, block=True, timeout=None):
+    def put_with_result(self, item, block=True, timeout=None, force=False):
         with self._lock:
             task_id = item["path"]
             durable_file_job = bool(
@@ -446,11 +446,11 @@ class DeduplicatedQueue(queue.PriorityQueue):
                 and os.path.isfile(task_id)
             )
             if durable_file_job:
-                admission = self._durable.admit(item)
+                admission = self._durable.admit(item, force=force)
                 if not admission.accepted:
                     return {"queued": False, "status": admission.status, "job_id": admission.job_id}
                 item = {**item, "_job_id": admission.job_id}
-            if task_id not in self._queued and task_id not in self._processing:
+            if (force or (task_id not in self._queued and task_id not in self._processing)) and not (durable_file_job and task_id in self._queued):
                 # Priority: 0 (Detect), 1 (ASR), 2 (Transcribe)
                 task_type = item.get("type", "transcribe")
                 priority = 0 if task_type == "detect_language" else (1 if task_type == "asr" else 2)
@@ -807,6 +807,7 @@ def prepare_media_queue_job(
     file_path: str,
     transcription_type: str,
     force_language: LanguageCode = LanguageCode.NONE,
+    force: bool = False,
     audio_tracks=None,
     **task_kwargs,
 ):
@@ -815,6 +816,7 @@ def prepare_media_queue_job(
         file_path,
         transcription_type,
         force_language,
+        force=force,
         audio_tracks=audio_tracks,
         **task_kwargs,
     )
@@ -824,6 +826,7 @@ def enqueue_media_job(
     file_path: str,
     transcription_type: str,
     force_language: LanguageCode = LanguageCode.NONE,
+    force: bool = False,
     audio_tracks=None,
     **task_kwargs,
 ):
@@ -833,6 +836,7 @@ def enqueue_media_job(
         file_path,
         transcription_type,
         force_language=force_language,
+        force=force,
         audio_tracks=audio_tracks,
         **task_kwargs,
     )
@@ -840,16 +844,51 @@ def enqueue_media_job(
         return plan
     task = plan.get("task")
     if task:
+        task["force"] = force
         if hasattr(task_queue, "put_with_result"):
-            admission = task_queue.put_with_result(task)
+            admission = task_queue.put_with_result(task, force=force)
             plan["status"] = admission["status"]
             if admission.get("job_id"):
                 plan["job_id"] = admission["job_id"]
         else:
-            accepted = task_queue.put(task)
+            accepted = task_queue.put(task, force=force)
             if accepted is False:
                 plan["status"] = "already_active"
     return plan
+
+
+def queue_single_forced_file(
+    file_path: str,
+    transcription_type: Union[str, None] = None,
+    force_language: Union[str, None] = None,
+    audio_tracks=None,
+    allow_invalid: bool = False,
+):
+    if not file_path or not str(file_path).strip():
+        return {"status": "error", "message": "file_path is required"}
+
+    transcription_type = (transcription_type or transcribe_or_translate).lower()
+    if transcription_type not in {"transcribe", "translate"}:
+        return {"status": "error", "message": "transcription_type must be transcribe or translate"}
+
+    mapped_path = path_mapping(file_path)
+    if not allow_invalid:
+        if not os.path.exists(mapped_path):
+            return {"status": "error", "message": f"File not found: {mapped_path}"}
+        if not os.path.isfile(mapped_path):
+            return {"status": "error", "message": f"Path is not a file: {mapped_path}"}
+        base_name = os.path.basename(mapped_path)
+        if not (has_video_extension(base_name) or has_audio_extension(base_name)):
+            return {"status": "error", "message": f"Unsupported media file: {mapped_path}"}
+
+    force_language_code = LanguageCode.from_string(force_language) if force_language else LanguageCode.NONE
+    return enqueue_media_job(
+        mapped_path,
+        transcription_type,
+        force_language=force_language_code,
+        force=True,
+        audio_tracks=audio_tracks,
+    )
 
 
 def collect_startup_inventory(
@@ -1510,6 +1549,16 @@ def batch(
 ):
     return transcribe_existing(directory, LanguageCode.from_string(forceLanguage))
 
+
+@app.post("/force")
+def force_enqueue(payload: dict = Body(...)):
+    return queue_single_forced_file(
+        file_path=payload.get("file_path"),
+        transcription_type=payload.get("transcription_type"),
+        force_language=payload.get("force_language"),
+        audio_tracks=payload.get("audio_tracks"),
+        allow_invalid=bool(payload.get("allow_invalid", False)),
+    )
 
 # ============================================================================
 # REFACTORED /ASR ENDPOINT WITH HASH-BASED DEDUPLICATION AND BLOCKING

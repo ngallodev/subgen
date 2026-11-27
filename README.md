@@ -244,6 +244,10 @@ Create two separate Webhooks in Tautulli pointing to `http://<your-ip>:9000/taut
 
 ---
 
+## Force a media file
+
+`POST /force` requests transcription or translation for one media file even when Subgen's normal subtitle and skip checks would reject it. The request still passes through the shared queue, durable job journal when enabled, and normal output publication safeguards. See [the `/force` API contract](docs/force-transcription.md) for request fields and response statuses.
+
 ## ⚙️ Configuration (Environment Variables)
 
 *Note: Subgen recently standardized environment variables (e.g., `PLEX_TOKEN`). Legacy names (e.g., `PLEXTOKEN`) are still fully supported for backwards compatibility!*

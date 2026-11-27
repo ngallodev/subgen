@@ -170,8 +170,8 @@ class DurableJobStore:
         return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
     @_serialized
-    def admit(self, task: dict[str, Any]) -> Admission:
-        plain = _as_plain_task(task)
+    def admit(self, task: dict[str, Any], force: bool = False) -> Admission:
+        plain = _as_plain_task({**task, "force": force or task.get("force", False)})
         path = plain["path"]
         operation = plain["transcribe_or_translate"]
         language = str(plain.get("force_language") or "")
@@ -193,16 +193,55 @@ class DurableJobStore:
                 (_canonical_path(path),),
             ).fetchone()
             if path_active and path_active["active_key"] != active_key:
+                promotable = (
+                    force
+                    and path_active["status"] in {"pending", "retry_due"}
+                    and path_active["operation"] == operation
+                )
+                if promotable:
+                    conflict = conn.execute(
+                        "SELECT job_id FROM subtitle_jobs WHERE active_key=? AND job_id<>?",
+                        (active_key, path_active["job_id"]),
+                    ).fetchone()
+                    if not conflict:
+                        conn.execute(
+                            "UPDATE subtitle_jobs SET active_key=?,language=?,force=1,task_json=?,updated_at=? WHERE job_id=?",
+                            (active_key, language, encoded, now, path_active["job_id"]),
+                        )
+                        conn.execute("COMMIT")
+                        return Admission(False, path_active["job_id"], "promoted")
                 conn.execute("COMMIT")
                 status = "busy" if path_active["status"] in {"running", "publishing"} else "already_active"
                 return Admission(False, path_active["job_id"], status)
             existing = conn.execute(
-                "SELECT job_id, status FROM subtitle_jobs WHERE active_key=?",
+                "SELECT job_id, status, force FROM subtitle_jobs WHERE active_key=?",
                 (active_key,),
             ).fetchone()
             if existing:
+                if force and existing["force"]:
+                    conn.execute("COMMIT")
+                    return Admission(False, existing["job_id"], "already_active")
+                if force and not existing["force"] and existing["status"] == "pending":
+                    conn.execute(
+                        "UPDATE subtitle_jobs SET force=1, task_json=?, updated_at=? WHERE job_id=?",
+                        (encoded, now, existing["job_id"]),
+                    )
+                    conn.execute("COMMIT")
+                    return Admission(False, existing["job_id"], "promoted")
                 conn.execute("COMMIT")
                 return Admission(False, existing["job_id"], "busy" if existing["status"] in {"running", "publishing"} else "already_active")
+            if force:
+                pending = conn.execute(
+                    "SELECT job_id, task_json FROM subtitle_jobs WHERE canonical_path=? AND operation=? AND status='pending' ORDER BY created_at LIMIT 1",
+                    (_canonical_path(path), operation),
+                ).fetchone()
+                if pending:
+                    conn.execute(
+                        "UPDATE subtitle_jobs SET active_key=?,language=?,force=1,task_json=?,updated_at=? WHERE job_id=?",
+                        (active_key, language, encoded, now, pending["job_id"]),
+                    )
+                    conn.execute("COMMIT")
+                    return Admission(False, pending["job_id"], "promoted")
             conn.execute(
                 """INSERT INTO subtitle_jobs
                    (job_id, canonical_path, operation, language, active_key,
