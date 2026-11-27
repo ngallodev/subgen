@@ -59,8 +59,13 @@ def transcribe_existing(root):
 
     records = [json.loads(line) for line in worker_log.read_text(encoding="utf-8").splitlines()]
     result = json.loads(worker_result.read_text(encoding="utf-8"))
-    assert len(records) == 3
-    assert len({row["file_id"] for row in records}) == 3
+    decisions = [row for row in records if row.get("event") == "startup_scan.benchmark_decision"]
+    probe_summaries = [row for row in records if row.get("event") == "startup_scan.benchmark_probe_summary"]
+    assert len(decisions) == 3
+    assert len({row["file_id"] for row in decisions}) == 3
+    assert len(probe_summaries) == 1
+    assert probe_summaries[0]["probe_requests"] == 0
+    assert probe_summaries[0]["probe_failures"] == 0
     assert result["decision_count"] == 2
     assert result["non_media_count"] == 1
     assert result["filesystem_elapsed_ms"] >= 0

@@ -297,15 +297,7 @@ def plan_media_record(
     if plan["status"] in {"skip", "active"}:
         signature_ms = 0.0
         subtitle_signature = ""
-        matching_subtitles = []
-        if plan["status"] == "skip":
-            signature_started_at = time.perf_counter()
-            subtitle_signature, matching_subtitles = deps.compute_subtitle_signature(
-                media["path"],
-                inventory,
-                {},
-            )
-            signature_ms = (time.perf_counter() - signature_started_at) * 1000
+        matching_subtitles = subtitle_rows or []
         return {
             "media": media,
             "queue_path": queue_path,

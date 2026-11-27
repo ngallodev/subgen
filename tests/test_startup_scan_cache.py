@@ -1104,6 +1104,7 @@ def test_startup_scan_logs_policy_payload_when_enabled(monkeypatch, tmp_path):
         subgen,
         "get_startup_policy_payload",
         lambda: {
+            "decision_cache_version": 2,
             "transcribe_or_translate": "translate",
             "lrc_for_audio_files": True,
             "skip_unknown_language": False,
@@ -1119,6 +1120,11 @@ def test_startup_scan_logs_policy_payload_when_enabled(monkeypatch, tmp_path):
             "only_match_subgen_subtitles": False,
             "force_detected_language_to": "",
             "should_whisper_detect_audio_language": False,
+            "ignore_forced_subtitles": True,
+            "subtitle_language_naming_type": "ISO_639_2_B",
+            "show_in_subname_subgen": True,
+            "show_in_subname_model": True,
+            "whisper_model": "",
         },
     )
     monkeypatch.setattr(subgen, "startup_scan_benchmark_include_policy", True)
