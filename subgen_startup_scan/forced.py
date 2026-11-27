@@ -1,6 +1,8 @@
 import logging
 import os
 
+from .roots import find_skip_marker, parse_roots
+
 
 def startup_scan_existing_forced_language(
     transcribe_folders_spec: str,
@@ -17,7 +19,7 @@ def startup_scan_existing_forced_language(
     new_file_handler_factory,
     retain_observer,
 ) -> None:
-    folders = [path for path in transcribe_folders_spec.split("|") if path]
+    folders = parse_roots(transcribe_folders_spec)
     if not folders:
         return
 
@@ -32,6 +34,10 @@ def startup_scan_existing_forced_language(
         conn = db.conn
 
         for path in folders:
+            marker = find_skip_marker(path, is_directory=os.path.isdir(path))
+            if marker:
+                logging.info("Skipping forced-language root beneath skip marker %s: %s", marker, path)
+                continue
             if not os.path.exists(path):
                 logging.warning("%s does not exist, skipping startup scan.", path)
                 continue
@@ -66,7 +72,7 @@ def startup_scan_existing_forced_language(
 
     observer = observer_factory()
     for path in folders:
-        if os.path.isdir(path):
+        if os.path.isdir(path) and not find_skip_marker(path, is_directory=True):
             handler = new_file_handler_factory()
             observer.schedule(handler, path, recursive=True)
     retain_observer(observer)

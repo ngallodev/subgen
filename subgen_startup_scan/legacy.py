@@ -1,6 +1,8 @@
 import logging
 import os
 
+from .roots import parse_roots
+
 
 def legacy_startup_scan_existing(
     transcribe_folder_spec: str,
@@ -16,7 +18,7 @@ def legacy_startup_scan_existing(
     transcribe_or_translate: str,
     retain_observer,
 ) -> None:
-    folders = [path for path in transcribe_folder_spec.split("|") if path]
+    folders = parse_roots(transcribe_folder_spec)
     if skip_startup_scan:
         logging.info("SKIP_STARTUP_SCAN enabled - skipping existing file scan.")
     else:

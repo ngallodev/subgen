@@ -269,18 +269,25 @@ Create two separate Webhooks in Tautulli pointing to `http://<your-ip>:9000/taut
 | `PROCESS_MEDIA_ON_PLAY` | `True` | Generate subs for media when it is played (when triggered by webhook). |
 | `TRANSCRIBE_FOLDERS` | `''` | Pipe-separated list (e.g., `/tv&#124;/movies`) to recurse through and queue existing media. |
 | `MONITOR` | `False` | Actively watches `TRANSCRIBE_FOLDERS` in real-time for newly pasted files. |
-| `STARTUP_SCAN_BACKEND` | `legacy` | Selects startup scan behavior. Use `legacy` for the stock recursive scan path or `persistent` for the SQLite-backed cached scanner. |
-| `STARTUP_SCAN_DB_PATH` | `/subgen/state/subgen_scan.db` | SQLite cache for startup scan state, excluded files, and subtitle inventory. |
-| `STARTUP_SCAN_BENCHMARK_LOGGING` | `False` | Off by default. When enabled, writes structured JSONL timing records to the configured benchmark log path. |
-| `STARTUP_SCAN_BENCHMARK_LOG_PATH` | `/subgen/state/startup_scan_benchmarks.jsonl` | Host-mounted log file for benchmark output. |
-| `STARTUP_SCAN_PLANNER_TRACE_LOGGING` | `False` | Off by default. When enabled, adds planner sub-step timings for startup scan classification and queue decisions. |
-| `STARTUP_SCAN_MONITOR_ASYNC_START` | `True` | Starts the recursive monitor in the background so warm startup does not block on watcher initialization. |
+| `STARTUP_SCAN_BACKEND` | `legacy` | Select the startup scan path. Use `legacy` for stock behavior or `persistent` to enable the cached startup backend. |
+| `STARTUP_SCAN_DB_PATH` | `/subgen/state/subgen_scan.db` | Location of the persistent startup-scan SQLite database when `STARTUP_SCAN_BACKEND=persistent`. |
+| `STARTUP_SCAN_BENCHMARK` | `False` | Enable startup scan timing collection and JSONL output. Off by default. |
+| `STARTUP_SCAN_BENCHMARK_LOGGING` | `False` | Compatibility switch for writing startup benchmark timing events. |
+| `STARTUP_SCAN_BENCHMARK_LOG_PATH` | `/subgen/state/startup_scan_benchmarks.jsonl` | Optional path for startup benchmark output when benchmark logging is enabled. |
+| `STARTUP_SCAN_PLANNER_TRACE_LOGGING` | `False` | Optional. Enable detailed startup planner timing output for debugging or benchmarking. |
+| `STARTUP_SCAN_MONITOR_ASYNC_START` | `True` | Optional. Start the startup-scan file monitor in the background instead of blocking startup on watcher initialization. |
 | `PLEX_QUEUE_NEXT_EPISODE` | `False` | Auto-queues the *next* Plex episode when Subgen is triggered. |
 | `PLEX_QUEUE_SEASON` | `False` | Auto-queues the *entire remaining season* when Subgen is triggered. |
 | `PLEX_QUEUE_SERIES` | `False` | Auto-queues the *entire remaining series* when Subgen is triggered. |
 | `WEBHOOK_URL_COMPLETED` | `''` | Sends a POST to the `WEBHOOK_URL_COMPLETED` URL with a JSON containing: <br><code>{<br>&nbsp;&nbsp;"event": "transcribed",<br>&nbsp;&nbsp;"file": "/absolute/path/to/video.mkv",<br>&nbsp;&nbsp;"subtitle": "/absolute/path/to/video.en.srt",<br>&nbsp;&nbsp;"language": "en"<br>}</code><br>It will not fire on skips, `/asr` or `/detect-language`. |
 
-For the persistent startup-scan backend internals, schema, ERD, data flow, and benchmark notes, see [subgen_startup_scan/README.md](subgen_startup_scan/README.md).
+For persistent startup-scan design, architecture, schema, data flow, and benchmark documentation, see [subgen_startup_scan/README.md](subgen_startup_scan/README.md).
+
+The benchmark notes currently cover more than the live `/movies/downloads/nzb` comparison set:
+
+1. a sanitized representative subset (`Subset A`) with `33` media files
+2. the live `/movies/downloads/nzb` stock-vs-current wall-clock comparison
+3. a full-library warm reference used to track regressions
 
 ### ⏭️ Skip Logic & Audio Targeting
 *Prevent Subgen from wasting time on files that don't need subtitles.*
@@ -322,6 +329,7 @@ For the persistent startup-scan backend internals, schema, ERD, data flow, and b
 | `WEBHOOK_PORT` | `9000` | Port used to listen for webhooks and Bazarr requests. |
 | `PUID` / `PGID` | `99` / `100` | Run container as a specific user/group (helps with file permissions). |
 | `DEBUG` | `True` | Outputs extra logs, helpful for troubleshooting paths or webhook hits. |
+| `LOG_LEVEL` | Defaults to `DEBUG` when `DEBUG=True`, otherwise `INFO` | Set the Python log level (`DEBUG`, `INFO`, `WARNING`, or `ERROR`). This takes precedence over `DEBUG`. |
 | `RELOAD_SCRIPT_ON_CHANGE` | `False` | (Dev) Auto-reloads uvicorn if `subgen.py` is edited. |
 | `UPDATE` | `False` | (Standalone) Will pull the latest `subgen.py` from repo via `launcher.py`. |
 | `USE_PATH_MAPPING` | `False` | Set to True if your media server and Subgen map their volumes differently. |

@@ -1,5 +1,5 @@
 from dataclasses import dataclass
-from typing import Protocol, Any
+from typing import Any, Protocol
 
 from .config import get_startup_scan_backend_name
 from .dependencies import StartupScanDependencies
@@ -10,7 +10,7 @@ class StartupScanBackend(Protocol):
     def name(self) -> str: ...
     def initialize(self) -> None: ...
     def startup_scan_existing(self, transcribe_folder_spec: str) -> None: ...
-    def refresh_processed_file(self, path: str, transcription_type: str, force_language: Any, audio_tracks=None) -> None: ...
+    def refresh_processed_file(self, path: str, transcription_type: str, force_language: Any, audio_tracks=None, generated_output_path=None, generated_output_language=None) -> None: ...
 
 
 @dataclass
@@ -26,13 +26,15 @@ class PersistentStartupScanBackend:
 
     def startup_scan_existing(self, transcribe_folder_spec: str) -> None:
         if self.deps.persistent_startup_scan_existing:
-            self.deps.persistent_startup_scan_existing(transcribe_folder_spec)
-            return
-        run_startup_scan_existing(self.deps, transcribe_folder_spec)
+            return self.deps.persistent_startup_scan_existing(transcribe_folder_spec)
+        return run_startup_scan_existing(self.deps, transcribe_folder_spec)
 
-    def refresh_processed_file(self, path: str, transcription_type: str, force_language: Any, audio_tracks=None) -> None:
+    def refresh_processed_file(self, path: str, transcription_type: str, force_language: Any, audio_tracks=None, generated_output_path=None, generated_output_language=None) -> None:
         if self.deps.persistent_refresh_processed_file:
-            self.deps.persistent_refresh_processed_file(path, transcription_type, force_language, audio_tracks)
+            self.deps.persistent_refresh_processed_file(
+                path, transcription_type, force_language, audio_tracks,
+                generated_output_path, generated_output_language,
+            )
 
 
 @dataclass
@@ -47,9 +49,9 @@ class LegacyStartupScanBackend:
 
     def startup_scan_existing(self, transcribe_folder_spec: str) -> None:
         if self.deps.legacy_startup_scan_existing:
-            self.deps.legacy_startup_scan_existing(transcribe_folder_spec)
+            return self.deps.legacy_startup_scan_existing(transcribe_folder_spec)
 
-    def refresh_processed_file(self, path: str, transcription_type: str, force_language: Any, audio_tracks=None) -> None:
+    def refresh_processed_file(self, path: str, transcription_type: str, force_language: Any, audio_tracks=None, generated_output_path=None, generated_output_language=None) -> None:
         return None
 
 

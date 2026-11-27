@@ -52,8 +52,10 @@ import json
 import logging
 import os
 import queue
+import re
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import xml.etree.ElementTree as ET
@@ -62,7 +64,7 @@ from contextlib import asynccontextmanager
 from datetime import datetime
 from functools import lru_cache
 from threading import Event, Lock, Timer
-from typing import List, Union
+from typing import Union
 
 import av
 import faster_whisper
@@ -83,9 +85,14 @@ from subgen_startup_scan.association import current_sidecar_state
 from subgen_startup_scan.backend import build_startup_scan_backend
 from subgen_startup_scan.classifier import (
     plan_media_record as package_plan_media_record,
+)
+from subgen_startup_scan.classifier import (
     prepare_media_queue_job as package_prepare_media_queue_job,
 )
 from subgen_startup_scan.config import (
+    get_startup_scan_backend_name,
+    get_startup_scan_benchmark,
+    get_startup_scan_benchmark_include_policy,
     get_startup_scan_monitor_async_start,
     get_startup_scan_planner_trace_logging,
 )
@@ -93,32 +100,54 @@ from subgen_startup_scan.dependencies import StartupScanDependencies
 from subgen_startup_scan.entrypoint import transcribe_existing_dispatch
 from subgen_startup_scan.facade import (
     collect_startup_inventory as package_collect_startup_inventory,
-    is_relevant_inventory_file_name as package_is_relevant_inventory_file_name,
+)
+from subgen_startup_scan.facade import (
     startup_scan_inventory_signature as package_startup_scan_inventory_signature,
+)
+from subgen_startup_scan.facade import (
     startup_scan_inventory_signature_matches as package_startup_scan_inventory_signature_matches,
+)
+from subgen_startup_scan.facade import (
     startup_scan_store_inventory_signature as package_startup_scan_store_inventory_signature,
 )
 from subgen_startup_scan.forced import startup_scan_existing_forced_language as package_forced_startup_scan_existing
 from subgen_startup_scan.inventory import StartupInventory
-from subgen_startup_scan.legacy import legacy_startup_scan_existing as package_legacy_startup_scan_existing
-from subgen_startup_scan.policy import startup_scan_policy_signature
+from subgen_startup_scan.jobs import LEASE_RENEW_INTERVAL_SECONDS, DurableJobStore
+from subgen_startup_scan.policy import startup_scan_policy_payload, startup_scan_policy_signature
+from subgen_startup_scan.roots import find_skip_marker, parse_roots
 from subgen_startup_scan.runtime import (
     initialize_startup_scan as package_startup_scan_initialize,
+)
+from subgen_startup_scan.runtime import (
     json_default,
-    refresh_processed_file as package_refresh_processed_file,
     startup_scan_deserialize_audio_tracks,
-    startup_scan_get_media_row as package_startup_scan_get_media_row,
-    startup_scan_process_record as package_startup_scan_process_record,
-    startup_scan_record_excluded as package_startup_scan_record_excluded,
-    startup_scan_record_media as package_startup_scan_record_media,
-    startup_scan_record_subtitle as package_startup_scan_record_subtitle,
     startup_scan_enrich_subtitle_records,
     startup_scan_probe_cache_info,
+)
+from subgen_startup_scan.runtime import (
+    refresh_processed_file as package_refresh_processed_file,
+)
+from subgen_startup_scan.runtime import (
+    startup_scan_get_media_row as package_startup_scan_get_media_row,
+)
+from subgen_startup_scan.runtime import (
+    startup_scan_process_record as package_startup_scan_process_record,
+)
+from subgen_startup_scan.runtime import (
+    startup_scan_record_excluded as package_startup_scan_record_excluded,
+)
+from subgen_startup_scan.runtime import (
+    startup_scan_record_media as package_startup_scan_record_media,
+)
+from subgen_startup_scan.runtime import (
+    startup_scan_record_subtitle as package_startup_scan_record_subtitle,
 )
 from subgen_startup_scan.service import startup_scan_existing as package_startup_scan_existing
 from subgen_startup_scan.signatures import compute_subtitle_signature as package_compute_subtitle_signature
 from subgen_startup_scan.state import (
     retain_startup_scan_observer as package_retain_startup_scan_observer,
+)
+from subgen_startup_scan.state import (
     run_with_startup_scan_lock as package_run_with_startup_scan_lock,
 )
 from subgen_startup_scan.traversal import collect_startup_records as package_startup_scan_collect_records
@@ -152,6 +181,17 @@ def get_env_with_fallback(new_name: str, old_name: str, default_value=None, conv
         return convert_func(value)
     
     return value
+
+
+def _parse_log_level(level_name: str | None, default_level: int) -> int:
+    if not level_name:
+        return default_level
+    normalized = str(level_name).strip().upper()
+    level = getattr(logging, normalized, None)
+    if isinstance(level, int):
+        return level
+    logging.warning("Invalid log level '%s', using %s", level_name, logging.getLevelName(default_level))
+    return default_level
 
 
 def _get_positive_int_env(name: str, default_value: int) -> int:
@@ -237,6 +277,19 @@ ignore_forced_subtitles = convert_to_bool(os.getenv('IGNORE_FORCED_SUBTITLES', T
 should_whisper_detect_audio_language = convert_to_bool(os.getenv('SHOULD_WHISPER_DETECT_AUDIO_LANGUAGE', False))
 startup_scan_db_path = get_env_with_fallback('STARTUP_SCAN_DB_PATH', 'SUBGEN_SCAN_DB_PATH', '/subgen/state/subgen_scan.db')
 startup_scan_benchmark_logging = convert_to_bool(os.getenv('STARTUP_SCAN_BENCHMARK_LOGGING', False))
+startup_scan_benchmark = get_startup_scan_benchmark(False)
+startup_scan_benchmark_include_policy = get_startup_scan_benchmark_include_policy(False)
+startup_scan_benchmark_worker_isolation = convert_to_bool(
+    os.getenv("STARTUP_SCAN_BENCHMARK_WORKER_ISOLATION", False)
+)
+if (
+    startup_scan_benchmark_worker_isolation
+    and not startup_scan_benchmark
+    and os.getenv("STARTUP_SCAN_BENCHMARK_UNTIMED_SEED") != "1"
+):
+    raise RuntimeError(
+        "Worker isolation requires STARTUP_SCAN_BENCHMARK=1, except for the internal untimed warm-cache seed"
+    )
 startup_scan_benchmark_log_path = os.getenv('STARTUP_SCAN_BENCHMARK_LOG_PATH', '/subgen/state/startup_scan_benchmarks.jsonl')
 startup_scan_planner_trace_logging = get_startup_scan_planner_trace_logging(False)
 startup_scan_monitor_async_start = get_startup_scan_monitor_async_start(True)
@@ -244,6 +297,15 @@ startup_scan_force_rewalk = get_env_with_fallback('STARTUP_SCAN_FORCE_REWALK', '
 startup_scan_classify_workers = _get_positive_int_env('STARTUP_SCAN_CLASSIFY_WORKERS', min(4, os.cpu_count() or 1))
 show_in_subname_subgen = convert_to_bool(os.getenv('SHOW_IN_SUBNAME_SUBGEN', True))
 show_in_subname_model = convert_to_bool(os.getenv('SHOW_IN_SUBNAME_MODEL', True))
+
+default_log_level = logging.DEBUG if debug else logging.INFO
+log_level = _parse_log_level(os.getenv('LOG_LEVEL'), default_log_level)
+skip_detail_log_level_name = get_env_with_fallback('STARTUP_SCAN_SKIP_LOG_LEVEL', 'SUBGEN_SKIP_LOG_LEVEL', '')
+skip_detail_log_level = (
+    _parse_log_level(skip_detail_log_level_name, logging.DEBUG)
+    if str(skip_detail_log_level_name).strip()
+    else None
+)
 
 # Advanced Configuration
 try:
@@ -270,10 +332,12 @@ AUDIO_EXTENSIONS = (
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     if transcribe_folders:
-        if skip_startup_scan:
-            logging.info("SKIP_STARTUP_SCAN is enabled — skipping the startup scan of existing files.")
-        else:
-            threading.Thread(target=transcribe_existing, args=(transcribe_folders,), daemon=True).start()
+        threading.Thread(
+            target=transcribe_existing,
+            args=(transcribe_folders,),
+            kwargs={"automatic_startup": True},
+            daemon=True,
+        ).start()
     yield
 
 app = FastAPI(lifespan=lifespan)
@@ -352,6 +416,10 @@ def generate_audio_hash(audio_content: bytes, task: str = None, language: str = 
 # REFACTORED DEDUPLICATED QUEUE WITH BETTER TRACKING
 # ============================================================================
 
+class SupersededJobError(RuntimeError):
+    """A durable request no longer matches its admitted source or policy."""
+
+
 class DeduplicatedQueue(queue.PriorityQueue):
     """Queue that prevents duplicates, handles priority, and tracks status."""
     def __init__(self):
@@ -360,11 +428,29 @@ class DeduplicatedQueue(queue.PriorityQueue):
         self._processing = set() # Tracks task IDs currently being handled
         self._counter = 0
         self._lock = Lock()
+        self._durable = None
+        if get_startup_scan_backend_name(default="legacy") == "persistent":
+            self._durable = DurableJobStore(startup_scan_db_path + ".jobs")
 
     def put(self, item, block=True, timeout=None, force=False):
+        return self.put_with_result(item, block=block, timeout=timeout, force=force)["queued"]
+
+    def put_with_result(self, item, block=True, timeout=None, force=False):
         with self._lock:
             task_id = item["path"]
-            if force or (task_id not in self._queued and task_id not in self._processing):
+            durable_file_job = bool(
+                self._durable
+                and not item.get("audio_content")
+                and item.get("type", "transcribe") != "asr"
+                and isinstance(task_id, str)
+                and os.path.isfile(task_id)
+            )
+            if durable_file_job:
+                admission = self._durable.admit(item, force=force)
+                if not admission.accepted:
+                    return {"queued": False, "status": admission.status, "job_id": admission.job_id}
+                item = {**item, "_job_id": admission.job_id}
+            if (force or (task_id not in self._queued and task_id not in self._processing)) and not (durable_file_job and task_id in self._queued):
                 # Priority: 0 (Detect), 1 (ASR), 2 (Transcribe)
                 task_type = item.get("type", "transcribe")
                 priority = 0 if task_type == "detect_language" else (1 if task_type == "asr" else 2)
@@ -374,39 +460,126 @@ class DeduplicatedQueue(queue.PriorityQueue):
                 self._counter += 1
                 super().put((priority, -mtime, self._counter, item), block, timeout)
                 self._queued.add(task_id)
-                return True
-            return False
+                return {"queued": True, "status": "queued", "job_id": item.get("_job_id")}
+            return {"queued": False, "status": "already_active", "job_id": None}
 
     def get(self, block=True, timeout=None):
-        # PriorityQueue returns the tuple, we want just the item
-        priority, neg_mtime, tie_breaker, item = super().get(block, timeout)
-        with self._lock:
-            task_id = item["path"]
-            self._queued.discard(task_id)
-            self._processing.add(task_id)
-        return item
+        deadline = None if timeout is None else time.monotonic() + timeout
+        while True:
+            try:
+                remaining = None if deadline is None else max(0, deadline - time.monotonic())
+                _, _, _, item = super().get(block, timeout=remaining)
+                if self._durable and item.get("_job_id"):
+                    claimed = self._durable.claim(item["_job_id"])
+                    if claimed is None:
+                        super().task_done()
+                        with self._lock:
+                            self._queued.discard(item["path"])
+                        continue
+                    item = claimed
+                    item["force_language"] = LanguageCode.from_string(item.get("force_language") or "")
+                    item["audio_tracks"] = [
+                        {
+                            **track,
+                            "language": LanguageCode.from_string(track.get("language") or ""),
+                        }
+                        for track in item.get("audio_tracks") or []
+                    ]
+            except queue.Empty:
+                if self._durable:
+                    item = self._durable.claim()
+                    if item is not None:
+                        item["force_language"] = LanguageCode.from_string(item.get("force_language") or "")
+                        item["audio_tracks"] = [
+                            {
+                                **track,
+                                "language": LanguageCode.from_string(track.get("language") or ""),
+                            }
+                            for track in item.get("audio_tracks") or []
+                        ]
+                        with self._lock:
+                            self._processing.add(item["path"])
+                        with self.mutex:
+                            self.unfinished_tasks += 1
+                        return item
+                raise
+            with self._lock:
+                task_id = item["path"]
+                self._queued.discard(task_id)
+                self._processing.add(task_id)
+            return item
 
-    def mark_done(self, item):
+    def mark_done(self, item, success=False, error=None, outcome=None):
         with self._lock:
             task_id = item["path"]
             self._processing.discard(task_id)
+        if self._durable and item.get("_job_id"):
+            self._durable.finish(item, success=success, error=error, outcome=outcome)
+
+    def renew_job(self, item):
+        if self._durable and item.get("_job_id") and item.get("_claim_token"):
+            return self._durable.renew(item["_job_id"], item["_claim_token"])
+        return True
+
+    def complete_detection(self, item, detected_item):
+        return bool(self._durable and self._durable.complete_detection(item, detected_item))
+
+    def reserve_output(self, item, output_path):
+        return not self._durable or self._durable.set_publish_intent(
+            item,
+            output_path,
+            item.get("_temporary_output_path", ""),
+            item.get("_temporary_output_sha256", ""),
+        )
+
+    def publish_output(self, item, temporary_path, output_path, sha256, output_language="", output_format=""):
+        if self._durable and item.get("_job_id"):
+            return self._durable.set_publish_intent(
+                item, output_path, temporary_path, sha256, output_language, output_format
+            ) and self._durable.publish_file(
+                item, temporary_path, output_path, sha256, output_language, output_format
+            )
+        os.replace(temporary_path, output_path)
+        return True
+
+    def release_output(self, item, output_path):
+        if self._durable:
+            self._durable.release_output(item, output_path)
 
     def is_idle(self):
         with self._lock:
-            return self.empty() and len(self._processing) == 0
+            if not self.empty() or self._processing:
+                return False
+            return not self._durable or not self._durable.queued_tasks() and not self._durable.processing_tasks()
 
     def is_active(self, task_id):
         """Checks if a task_id is currently queued or processing."""
         with self._lock:
-            return task_id in self._queued or task_id in self._processing
+            return task_id in self._queued or task_id in self._processing or bool(self._durable and self._durable.is_active(task_id))
+
+    def verified_completions(self, candidates, *, operation, policy_signature):
+        """Get still-valid completed paths from the durable publication journal."""
+        if not self._durable:
+            return set()
+        return self._durable.verified_completions(
+            candidates,
+            operation=operation,
+            policy_signature=policy_signature,
+        )
 
     def get_queued_tasks(self):
         with self._lock:
-            return list(self._queued)
+            queued = set(self._queued)
+            if self._durable:
+                queued.update(self._durable.queued_tasks())
+            return list(queued)
 
     def get_processing_tasks(self):
         with self._lock:
-            return list(self._processing)
+            processing = set(self._processing)
+            if self._durable:
+                processing.update(self._durable.processing_tasks())
+            return list(processing)
 
 # Start queue
 task_queue = DeduplicatedQueue()
@@ -466,7 +639,14 @@ def _startup_scan_record_subtitle(conn, path: str, size: int, mtime: int, media_
     package_startup_scan_record_subtitle(conn, path, size, mtime, media_path, subtitle_type, language, last_seen)
 
 
-def _startup_scan_refresh_processed_file(path: str, transcription_type: str, force_language: LanguageCode, audio_tracks=None) -> None:
+def _startup_scan_refresh_processed_file(
+    path: str,
+    transcription_type: str,
+    force_language: LanguageCode,
+    audio_tracks=None,
+    generated_output_path: str | None = None,
+    generated_output_language=None,
+) -> None:
     package_refresh_processed_file(
         path,
         transcription_type,
@@ -482,6 +662,8 @@ def _startup_scan_refresh_processed_file(path: str, transcription_type: str, for
         get_startup_policy_signature=get_startup_policy_signature,
         db_factory=StartupScanDB,
         startup_scan_db_path=startup_scan_db_path,
+        generated_output_path=generated_output_path,
+        generated_output_language=generated_output_language,
     )
 
 
@@ -531,6 +713,12 @@ def _known_output_path_exists(expected_output: str, subtitle_rows: list[dict] | 
     return any(row.get("path") == expected_output for row in subtitle_rows)
 
 
+def log_skip_detail(message: str) -> None:
+    if skip_detail_log_level is None:
+        return
+    logging.log(skip_detail_log_level, message)
+
+
 def describe_skip_reason_pre_audio(
     file_path: str,
     target_language: LanguageCode,
@@ -549,19 +737,11 @@ def describe_skip_reason_pre_audio(
     if is_audio_file_extension(file_ext) and lrc_for_audio_files:
         lrc_path = os.path.join(os.path.dirname(file_path), f"{file_name}.lrc")
         if os.path.exists(lrc_path):
-            logging.info(f"Skipping {base_name}: LRC file already exists.")
+            log_skip_detail(f"Skipping {base_name}: LRC file already exists.")
             return True, "skipped", "Skipped by should_skip_file."
 
     named_output_configured = subtitle_language_name and LanguageCode.is_valid_language(subtitle_language_name)
     external_lang = LanguageCode.from_string(subtitle_language_name) if named_output_configured else LanguageCode.NONE
-
-    if target_language == LanguageCode.NONE:
-        if skip_unknown_language:
-            logging.info(f"Skipping {base_name}: Audio language unknown and SKIP_UNKNOWN_LANGUAGE is enabled.")
-            return True, "skipped", "Skipped by should_skip_file."
-        if skip_if_no_audio_language_but_subtitles_exist and subtitle_rows:
-            logging.info(f"Skipping {base_name}: Audio language unknown but subtitles already exist.")
-            return True, "skipped", "Skipped by should_skip_file."
 
     if subtitle_rows and skip_if_target_subtitle_exists:
         if named_output_configured and _known_external_subtitle_exists(
@@ -569,26 +749,27 @@ def describe_skip_reason_pre_audio(
             external_lang,
             only_match_subgen_subtitles=only_match_subgen_subtitles,
         ):
-            logging.info(f"Skipping {base_name}: Subtitles already exist in custom name '{subtitle_language_name}'.")
+            log_skip_detail(f"Skipping {base_name}: Subtitles already exist in custom name '{subtitle_language_name}'.")
             return True, "skipped", "Skipped by should_skip_file."
 
-        if not (target_language == LanguageCode.NONE and named_output_configured):
+        if target_language != LanguageCode.NONE:
             if _known_external_subtitle_exists(
                 subtitle_rows,
                 target_language,
                 only_match_subgen_subtitles=only_match_subgen_subtitles,
             ):
                 if target_language == LanguageCode.NONE:
-                    logging.info(f"Skipping {base_name}: Subtitles already exist and audio language could not be detected from file metadata.")
+                    log_skip_detail(f"Skipping {base_name}: Subtitles already exist and audio language could not be detected from file metadata.")
                 else:
                     lang_name = target_language.to_name()
-                    logging.info(f"Skipping {base_name}: Subtitles already exist in {lang_name}.")
+                    log_skip_detail(f"Skipping {base_name}: Subtitles already exist in {lang_name}.")
                 return True, "skipped", "Skipped by should_skip_file."
 
-        expected_output = name_subtitle(file_path, target_language)
-        if _known_output_path_exists(expected_output, subtitle_rows):
-            logging.info(f"Skipping {base_name}: Generated subtitle '{os.path.basename(expected_output)}' already exists.")
-            return True, "skipped", "Skipped by should_skip_file."
+        if target_language != LanguageCode.NONE or named_output_configured:
+            expected_output = name_subtitle(file_path, target_language)
+            if _known_output_path_exists(expected_output, subtitle_rows):
+                log_skip_detail(f"Skipping {base_name}: Generated subtitle '{os.path.basename(expected_output)}' already exists.")
+                return True, "skipped", "Skipped by should_skip_file."
 
     if subtitle_rows and skip_if_external_sub_exists and named_output_configured:
         if _known_external_subtitle_exists(
@@ -597,7 +778,7 @@ def describe_skip_reason_pre_audio(
             only_match_subgen_subtitles=only_match_subgen_subtitles,
         ):
             lang_name = external_lang.to_name()
-            logging.info(f"Skipping {base_name}: External subtitles in {lang_name} already exist.")
+            log_skip_detail(f"Skipping {base_name}: External subtitles in {lang_name} already exist.")
             return True, "skipped", "Skipped by should_skip_file."
 
     return False, None, None
@@ -650,6 +831,7 @@ def enqueue_media_job(
     **task_kwargs,
 ):
     task_kwargs.setdefault("mtime", _safe_file_mtime(file_path))
+    task_kwargs.setdefault("policy_signature", get_startup_policy_signature())
     plan = prepare_media_queue_job(
         file_path,
         transcription_type,
@@ -662,8 +844,16 @@ def enqueue_media_job(
         return plan
     task = plan.get("task")
     if task:
-        task_queue.put(task, force=force)
-        plan["status"] = "queued"
+        task["force"] = force
+        if hasattr(task_queue, "put_with_result"):
+            admission = task_queue.put_with_result(task, force=force)
+            plan["status"] = admission["status"]
+            if admission.get("job_id"):
+                plan["job_id"] = admission["job_id"]
+        else:
+            accepted = task_queue.put(task, force=force)
+            if accepted is False:
+                plan["status"] = "already_active"
     return plan
 
 
@@ -701,11 +891,17 @@ def queue_single_forced_file(
     )
 
 
-def collect_startup_inventory(root_paths, recursive: bool = False, db: StartupScanDB | None = None):
+def collect_startup_inventory(
+    root_paths,
+    recursive: bool = False,
+    db: StartupScanDB | None = None,
+    use_directory_cache: bool = True,
+):
     return package_collect_startup_inventory(
         root_paths,
         recursive=recursive,
         db=db,
+        use_directory_cache=use_directory_cache,
         has_video_extension=has_video_extension,
         has_audio_extension=has_audio_extension,
         enrich_subtitle_records=startup_scan_enrich_subtitle_records,
@@ -730,7 +926,11 @@ def compute_subtitle_signature(media_path: str, inventory: StartupInventory, cac
 
 
 def get_startup_policy_signature():
-    return startup_scan_policy_signature(
+    return startup_scan_policy_signature(**get_startup_policy_payload())
+
+
+def get_startup_policy_payload():
+    return startup_scan_policy_payload(
         transcribe_or_translate=transcribe_or_translate,
         lrc_for_audio_files=lrc_for_audio_files,
         skip_unknown_language=skip_unknown_language,
@@ -746,6 +946,11 @@ def get_startup_policy_signature():
         only_match_subgen_subtitles=only_match_subgen_subtitles,
         force_detected_language_to=force_detected_language_to.to_iso_639_2_t() if force_detected_language_to else "",
         should_whisper_detect_audio_language=should_whisper_detect_audio_language,
+        ignore_forced_subtitles=ignore_forced_subtitles,
+        subtitle_language_naming_type=subtitle_language_naming_type,
+        show_in_subname_subgen=show_in_subname_subgen,
+        show_in_subname_model=show_in_subname_model,
+        whisper_model=whisper_model,
     )
 
 
@@ -785,28 +990,69 @@ def startup_scan_existing(transcribe_folder_spec: str):
     return package_startup_scan_existing(_build_startup_scan_dependencies(), transcribe_folder_spec)
 
 
-def _legacy_startup_scan_existing(transcribe_folder_spec: str) -> None:
-    folders = [path for path in transcribe_folder_spec.split("|") if path]
-    if skip_startup_scan:
+def _legacy_startup_scan_existing(transcribe_folder_spec: str, *, honor_skip_setting: bool = False) -> dict:
+    folders = parse_roots(transcribe_folder_spec)
+    summary = {"files_found": 0, "queued": 0, "errors": 0, "folders": []}
+    if skip_startup_scan and honor_skip_setting:
         logging.info("SKIP_STARTUP_SCAN is enabled - skipping existing file scan.")
     else:
         logging.info("Starting to search folders to see if we need to create subtitles.")
         logging.debug("The folders are:")
         for path in folders:
             logging.debug(path)
-            for root, dirs, files in os.walk(path):
+            marker = find_skip_marker(path, is_directory=os.path.isdir(path))
+            if marker:
+                logging.info("Skipping configured root beneath skip marker %s: %s", marker, path)
+                summary["folders"].append({"path": path, "exists": os.path.exists(path), "files_found": 0, "queued": 0, "errors": 0, "status": "marker_skipped"})
+                continue
+            if os.path.isfile(path):
+                folder_queued_before = summary["queued"]
+                summary["files_found"] += 1
+                if gen_subtitles_queue(path_mapping(path), transcribe_or_translate, LanguageCode.NONE):
+                    summary["queued"] += 1
+                summary["folders"].append({"path": path, "exists": True, "files_found": 1, "queued": summary["queued"] - folder_queued_before, "errors": 0})
+                continue
+            if not os.path.isdir(path):
+                summary["errors"] += 1
+                logging.warning(
+                    "Configured scan root does not exist inside the container or is not accessible; check the mount and permissions: %s",
+                    path,
+                )
+                summary["folders"].append({"path": path, "exists": False, "files_found": 0, "queued": 0, "errors": 1})
+                continue
+
+            files_before = summary["files_found"]
+            queued_before = summary["queued"]
+            errors_before = summary["errors"]
+            def _on_walk_error(exc):
+                summary["errors"] += 1
+                logging.warning("Could not read startup scan path %s: %s", getattr(exc, "filename", path), exc)
+
+            for root, dirs, files in os.walk(path, onerror=_on_walk_error):
                 if SKIP_MARKER in files:
-                    logging.info(f"Skipping (skip marker present): {root}")
+                    logging.info("Skipping (skip marker present): %s", root)
                     dirs.clear()
                     continue
                 for file_name in files:
+                    summary["files_found"] += 1
                     file_path = os.path.join(root, file_name)
-                    gen_subtitles_queue(path_mapping(file_path), transcribe_or_translate, LanguageCode.NONE)
-            if os.path.isfile(path) and has_audio(path):
-                gen_subtitles_queue(path_mapping(path), transcribe_or_translate, LanguageCode.NONE)
+                    if gen_subtitles_queue(path_mapping(file_path), transcribe_or_translate, LanguageCode.NONE):
+                        summary["queued"] += 1
+            summary["folders"].append({
+                "path": path,
+                "exists": True,
+                "files_found": summary["files_found"] - files_before,
+                "queued": summary["queued"] - queued_before,
+                "errors": summary["errors"] - errors_before,
+            })
+
+        logging.info(
+            "Startup scan complete: %s files found, %s queued, %s errors.",
+            summary["files_found"], summary["queued"], summary["errors"],
+        )
 
     if not monitor:
-        return
+        return summary
 
     observer = Observer()
     for path in folders:
@@ -816,14 +1062,18 @@ def _legacy_startup_scan_existing(transcribe_folder_spec: str) -> None:
     observer.start()
     package_retain_startup_scan_observer(observer)
     logging.info("Finished searching and queueing files for transcription. Now watching for new files.")
+    return summary
 
 
-def _build_startup_scan_dependencies() -> StartupScanDependencies:
+def _build_startup_scan_dependencies(*, honor_skip_setting: bool = True) -> StartupScanDependencies:
     return StartupScanDependencies(
         persistent_initialize=startup_scan_initialize,
-        persistent_startup_scan_existing=startup_scan_existing,
+        persistent_startup_scan_existing=None,
         persistent_refresh_processed_file=_startup_scan_refresh_processed_file,
-        legacy_startup_scan_existing=_legacy_startup_scan_existing,
+        legacy_startup_scan_existing=lambda folders: _legacy_startup_scan_existing(
+            folders,
+            honor_skip_setting=honor_skip_setting,
+        ),
         task_queue=task_queue,
         language_code=LanguageCode,
         has_audio=has_audio,
@@ -835,9 +1085,12 @@ def _build_startup_scan_dependencies() -> StartupScanDependencies:
         should_whisper_detect_audio_language=should_whisper_detect_audio_language,
         startup_scan_planner_trace_logging=startup_scan_planner_trace_logging,
         startup_scan_force_rewalk=startup_scan_force_rewalk,
+        skip_startup_scan=skip_startup_scan and honor_skip_setting,
         startup_scan_classify_workers=startup_scan_classify_workers,
         startup_scan_benchmark_log_path=startup_scan_benchmark_log_path,
         startup_scan_benchmark_logging=startup_scan_benchmark_logging,
+        startup_scan_benchmark=startup_scan_benchmark,
+        startup_scan_benchmark_include_policy=startup_scan_benchmark_include_policy,
         startup_scan_db_path=startup_scan_db_path,
         transcribe_or_translate=transcribe_or_translate,
         monitor=monitor,
@@ -854,6 +1107,7 @@ def _build_startup_scan_dependencies() -> StartupScanDependencies:
         inventory_signature_matches=_startup_scan_inventory_signature_matches,
         store_inventory_signature=_startup_scan_store_inventory_signature,
         get_startup_policy_signature=get_startup_policy_signature,
+        get_startup_policy_payload=get_startup_policy_payload,
         probe_cache_info=startup_scan_probe_cache_info,
         benchmark_logger_factory=BenchmarkLogger,
         benchmark_step=benchmark_step,
@@ -866,8 +1120,11 @@ def _build_startup_scan_dependencies() -> StartupScanDependencies:
     )
 
 
-def _get_startup_scan_backend():
-    return build_startup_scan_backend(_build_startup_scan_dependencies(), default="legacy")
+def _get_startup_scan_backend(*, honor_skip_setting: bool = True):
+    return build_startup_scan_backend(
+        _build_startup_scan_dependencies(honor_skip_setting=honor_skip_setting),
+        default="legacy",
+    )
 
 # ============================================================================
 # TRANSCRIPTION WORKER
@@ -878,8 +1135,41 @@ def transcription_worker():
     while True:
         task = None
         next_task = None
+        job_success = False
+        job_error = None
+        job_outcome = "failed"
+        lease_stop = Event()
+        lease_thread = None
         try:
             task = task_queue.get(block=True, timeout=1)
+            if task.get("_job_id"):
+                def _renew_job_lease():
+                    while not lease_stop.wait(LEASE_RENEW_INTERVAL_SECONDS):
+                        if not task_queue.renew_job(task):
+                            logging.error("Lost durable job claim for %s", task.get("_job_id"))
+                            return
+                lease_thread = threading.Thread(target=_renew_job_lease, daemon=True)
+                lease_thread.start()
+            if task.get("_job_id"):
+                if not task.get("force") and _is_in_skipped_dir(task["path"]):
+                    raise SupersededJobError("A .subgen_skip marker now covers this media path.")
+                try:
+                    source_stat = os.stat(task["path"])
+                except OSError as exc:
+                    # Network mounts can fail a stat transiently. Keep this
+                    # durable request retryable instead of dropping it as a
+                    # superseded input.
+                    raise RuntimeError(f"Could not stat source media: {exc}") from exc
+                source_mtime_ns = getattr(source_stat, "st_mtime_ns", None)
+                if (
+                    (task.get("_input_size") is not None and source_stat.st_size != task["_input_size"])
+                    or (task.get("_input_mtime_ns") is not None and source_mtime_ns != task["_input_mtime_ns"])
+                    or (task.get("_input_device") is not None and source_stat.st_dev != task["_input_device"])
+                    or (task.get("_input_inode") is not None and source_stat.st_ino != task["_input_inode"])
+                ):
+                    raise SupersededJobError("Source media changed after the job was admitted.")
+                if task.get("policy_signature") and task["policy_signature"] != get_startup_policy_signature():
+                    raise SupersededJobError("Subtitle policy changed after the job was admitted.")
             task_type = task.get("type", "transcribe")
             path = task.get("path", "unknown")
             display_name = os.path.basename(path) if ("/" in str(path) or "\\" in str(path)) else path
@@ -894,18 +1184,34 @@ def transcription_worker():
                 if "audio_content" in task: 
                     detect_language_from_upload(task)
                 else: 
-                    # Capture the transcription task to queue later
-                    next_task = detect_language_task(task['path'], original_task_data=task)
-            elif task_type == "asr":
+                    detected_task = detect_language_task(task['path'], original_task_data=task)
+                    if task.get("_job_id"):
+                        if not task_queue.complete_detection(task, detected_task):
+                            raise RuntimeError(f"Lost durable job claim during language detection: {task['_job_id']}")
+                        task.update(detected_task)
+                        task_type = task["type"]
+                    else:
+                        next_task = detected_task
+            if task_type == "asr":
                 asr_task_worker(task)
-            else: # transcribe
-                gen_subtitles(task['path'], task['transcribe_or_translate'], task['force_language'], audio_tracks=task.get('audio_tracks'))
+            elif task_type != "detect_language":
+                generated = gen_subtitles(
+                    task['path'],
+                    task.get('transcribe_or_translate') or transcribe_or_translate,
+                    task.get('force_language', LanguageCode.NONE),
+                    audio_tracks=task.get('audio_tracks'),
+                    job_context=task,
+                )
                 _get_startup_scan_backend().refresh_processed_file(
                     task['path'],
                     task.get('transcribe_or_translate') or transcribe_or_translate,
                     task.get('force_language', LanguageCode.NONE),
                     audio_tracks=task.get('audio_tracks'),
+                    generated_output_path=generated["output_path"],
+                    generated_output_language=generated.get("output_language"),
                 )
+                job_success = True
+                job_outcome = "succeeded"
                 
                 # --- METADATA REFRESH LOGIC ---
                 if 'plex_item_id' in task:
@@ -931,14 +1237,22 @@ def transcription_worker():
 
         except queue.Empty:
             continue
+        except SupersededJobError as e:
+            job_error = str(e)
+            job_outcome = "superseded"
+            logging.info("Superseded durable job %s: %s", task.get("_job_id") if task else "unknown", e)
         except Exception as e:
+            job_error = str(e)
             logging.error(f"Error processing task: {e}", exc_info=True)
         finally:
             if task:
+                lease_stop.set()
+                if lease_thread:
+                    lease_thread.join(timeout=1)
                 task_queue.task_done()
-                task_queue.mark_done(task)
-                
-                # Now that the detect task is removed from processing, it's safe to queue the transcription
+                task_queue.mark_done(task, success=job_success, error=job_error, outcome=job_outcome)
+
+                # The legacy queue releases the path before admitting the detected task.
                 if next_task:
                     if task_queue.put(next_task):
                         logging.debug(f"Queued transcription for detected language: {next_task['path']}")
@@ -947,9 +1261,12 @@ def transcription_worker():
                         
                 delete_model()
 
-# Create worker threads
-for _ in range(concurrent_transcriptions):
-    threading.Thread(target=transcription_worker, daemon=True).start()
+# Create worker threads unless a benchmark explicitly requests worker isolation.
+if startup_scan_benchmark_worker_isolation:
+    logging.info("Startup benchmark worker isolation is active; transcription workers were not started.")
+else:
+    for _ in range(concurrent_transcriptions):
+        threading.Thread(target=transcription_worker, daemon=True).start()
 
 # Define a filter class to hide common logging we don't want to see
 class MultiplePatternsFilter(logging.Filter):
@@ -974,22 +1291,16 @@ class MultiplePatternsFilter(logging.Filter):
         # Return False if any of the patterns are found, True otherwise
         return not any(pattern in record.getMessage() for pattern in patterns)
 
-# Configure logging
-if debug:
-    level = logging.DEBUG
-else:
-    level = logging.INFO
-
 logging.basicConfig(
     stream=sys.stderr, 
-    level=level, 
+    level=log_level,
     format="%(asctime)s %(levelname)s: %(message)s",
     datefmt="%Y-%m-%d %H:%M:%S" # This removes the ,123 part
 )
 
 # Get the root logger
 logger = logging.getLogger()
-logger.setLevel(level) # Set the logger level
+logger.setLevel(log_level) # Set the logger level
 
 for handler in logger.handlers:
     handler.addFilter(MultiplePatternsFilter())
@@ -1917,6 +2228,7 @@ def detect_language_task(path, original_task_data=None):
 
     except Exception as e:
         logging.error(f"Error detecting language for file: {e}", exc_info=True)
+        raise
         
     finally:
         delete_model()
@@ -1925,7 +2237,7 @@ def detect_language_task(path, original_task_data=None):
     task_data = {
         'path': path,
         'type': 'transcribe',
-        'transcribe_or_translate': transcribe_or_translate,
+        'transcribe_or_translate': (original_task_data or {}).get('transcribe_or_translate') or transcribe_or_translate,
         'force_language': detected_language
     }
     
@@ -2107,7 +2419,21 @@ def send_completion_webhook(source_file_path: str, subtitle_file_path: str, lang
     except Exception as e:
         logging.error(f"Failed to send completion webhook: {e}")
 
-def gen_subtitles(file_path: str, transcription_type: str, force_language: LanguageCode = LanguageCode.NONE, audio_tracks=None) -> None:
+
+def _sha256_path(file_path: str) -> str:
+    digest = hashlib.sha256()
+    with open(file_path, "rb") as handle:
+        for block in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+def gen_subtitles(
+    file_path: str,
+    transcription_type: str,
+    force_language: LanguageCode = LanguageCode.NONE,
+    audio_tracks=None,
+    job_context: dict | None = None,
+) -> dict:
     """Generates subtitles for a video file.
 
     Args:
@@ -2117,7 +2443,11 @@ def gen_subtitles(file_path: str, transcription_type: str, force_language: Langu
         audio_tracks: Pre-fetched audio track list; fetched from file if not provided.
     """
 
+    temporary_output_path = None
     try:
+        input_signature = _media_identity_fingerprint(file_path)
+        if input_signature is None:
+            raise FileNotFoundError(f"Media input is missing or unreadable: {file_path}")
         start_model()
 
         # Check if the file is an audio file before trying to extract audio
@@ -2149,30 +2479,89 @@ def gen_subtitles(file_path: str, transcription_type: str, force_language: Langu
         # If it is an audio file, write the LRC file
         if is_audio_file and lrc_for_audio_files:
             subtitle_file_path = file_name + '.lrc'
-            write_lrc(result, subtitle_file_path)
         else:
-            subtitle_file_path = name_subtitle(file_path, output_language)
-            result.to_srt_vtt(subtitle_file_path, word_level=word_level_highlight)
-            
-        # Trigger the downstream webhook
-        send_completion_webhook(file_path, subtitle_file_path, output_language, transcription_type)
+            subtitle_file_path = name_subtitle(file_path, output_language, transcription_type=transcription_type)
 
+        output_directory = os.path.dirname(os.path.abspath(subtitle_file_path))
+        output_extension = os.path.splitext(subtitle_file_path)[1].lower()
+        fd, temporary_output_path = tempfile.mkstemp(
+            prefix=f".{os.path.basename(subtitle_file_path)}.",
+            suffix=output_extension,
+            dir=output_directory,
+        )
+        os.close(fd)
+        if output_extension == ".lrc":
+            write_lrc(result, temporary_output_path)
+        else:
+            result.to_srt_vtt(temporary_output_path, word_level=word_level_highlight)
+
+        segments = list(getattr(result, "segments", []) or [])
+        with open(temporary_output_path, "rb+") as output_handle:
+            artifact = output_handle.read()
+            os.fsync(output_handle.fileno())
+        if segments and not artifact.strip():
+            raise ValueError("Subtitle renderer produced an empty artifact for non-empty transcription.")
+        if segments:
+            text_artifact = artifact.decode("utf-8-sig")
+            if output_extension == ".lrc":
+                if not re.search(r"\[\d{2}:\d{2}\.\d{2,3}\]", text_artifact):
+                    raise ValueError("Rendered LRC has no valid timestamped lyric entries.")
+            elif "-->" not in text_artifact:
+                raise ValueError("Rendered SRT has no valid cue timing lines.")
+        if _media_identity_fingerprint(file_path) != input_signature:
+            raise RuntimeError("Media input changed while subtitles were being generated.")
+        if job_context and not job_context.get("force") and _is_in_skipped_dir(file_path):
+            raise SupersededJobError("A .subgen_skip marker was added while subtitles were being generated.")
+
+        output_digest = hashlib.sha256(artifact).hexdigest()
+        if not task_queue.publish_output(
+            job_context or {},
+            temporary_output_path,
+            subtitle_file_path,
+            output_digest,
+            output_language=output_language.to_iso_639_2_t(),
+            output_format=output_extension.lstrip("."),
+        ):
+            raise RuntimeError(f"Subtitle output is reserved by another active job: {subtitle_file_path}")
+        temporary_output_path = None
+        published_stat = os.stat(subtitle_file_path)
+        if (
+            not os.path.isfile(subtitle_file_path)
+            or published_stat.st_size != len(artifact)
+            or _sha256_path(subtitle_file_path) != output_digest
+        ):
+            raise RuntimeError(f"Published subtitle verification failed: {subtitle_file_path}")
         # FIX: Provide the generated subtitle result to any waiting ASR endpoint requests
         with task_results_lock:
             if file_path in task_results:
                 task_results[file_path].set_result(result.to_srt_vtt(filepath=None, word_level=word_level_highlight))
 
     except Exception as e:
-        logging.info(f"Error processing or transcribing {file_path} in {force_language}: {e}")
+        logging.error("Error processing or transcribing %s in %s: %s", file_path, force_language, e, exc_info=True)
         # FIX: Inform waiting ASR endpoint requests of the error so they don't hang
         with task_results_lock:
             if file_path in task_results:
                 task_results[file_path].set_error(str(e))
+        raise
 
     finally:
+        if temporary_output_path and os.path.exists(temporary_output_path):
+            try:
+                os.unlink(temporary_output_path)
+            except OSError:
+                logging.warning("Could not remove temporary subtitle artifact %s", temporary_output_path)
         delete_model()
+
+    # The notification is deliberately after durable publication and verification.
+    send_completion_webhook(file_path, subtitle_file_path, output_language, transcription_type)
+    return {
+        "output_path": subtitle_file_path,
+        "output_language": output_language,
+        "format": os.path.splitext(subtitle_file_path)[1].lower().lstrip("."),
+        "sha256": output_digest,
+    }
         
-def define_subtitle_language_naming(language: LanguageCode, type):
+def define_subtitle_language_naming(language: LanguageCode, type, operation: str | None = None):
     """
     Determines the naming format for a subtitle language based on the given type. 
 
@@ -2189,7 +2578,7 @@ def define_subtitle_language_naming(language: LanguageCode, type):
     # This MUST come before switch_dict is built: its values are bound methods,
     # captured against whatever `language` refers to at construction time. Rebinding
     # `language` afterwards would leave them pointing at the original language.
-    if transcribe_or_translate == 'translate':
+    if (operation or transcribe_or_translate) == 'translate':
         language = LanguageCode.ENGLISH
     switch_dict = {
         "ISO_639_1": language.to_iso_639_1,
@@ -2200,7 +2589,7 @@ def define_subtitle_language_naming(language: LanguageCode, type):
     }
     return switch_dict.get(type, language.to_name)()
 
-def name_subtitle(file_path: str, language: LanguageCode) -> str:
+def name_subtitle(file_path: str, language: LanguageCode, transcription_type: str | None = None) -> str:
     """
     Name the subtitle file to be written, based on the source file and the language of the subtitle. 
     
@@ -2213,7 +2602,7 @@ def name_subtitle(file_path: str, language: LanguageCode) -> str:
     """
     subgen_part = ".subgen" if show_in_subname_subgen else ""
     model_part = f".{whisper_model}" if show_in_subname_model else ""
-    lang_part = define_subtitle_language_naming(language, subtitle_language_naming_type)
+    lang_part = define_subtitle_language_naming(language, subtitle_language_naming_type, operation=transcription_type)
     
     return f"{os.path.splitext(file_path)[0]}{subgen_part}{model_part}.{lang_part}.srt"
     
@@ -2354,19 +2743,35 @@ def choose_transcribe_language(file_path, forced_language, audio_tracks=None):
 def _media_probe_signature(file_path: str):
     try:
         stat_result = os.stat(file_path)
-    except OSError:
-        return None
+    except OSError as exc:
+        raise FileNotFoundError(f"Media file is missing or unreadable during probing: {file_path}") from exc
 
     return (
         os.path.abspath(file_path),
         int(stat_result.st_size),
         int(getattr(stat_result, "st_mtime_ns", int(stat_result.st_mtime * 1_000_000_000))),
+        int(getattr(stat_result, "st_dev", 0)),
+        int(getattr(stat_result, "st_ino", 0)),
+    )
+
+
+def _media_identity_fingerprint(file_path: str):
+    try:
+        stat_result = os.stat(file_path)
+    except OSError:
+        return None
+    return (
+        os.path.normcase(os.path.abspath(file_path)),
+        int(stat_result.st_size),
+        int(getattr(stat_result, "st_mtime_ns", int(stat_result.st_mtime * 1_000_000_000))),
+        int(getattr(stat_result, "st_dev", 0)),
+        int(getattr(stat_result, "st_ino", 0)),
     )
 
 
 @lru_cache(maxsize=8192)
-def _probe_media_streams_cached(file_path: str, file_size: int, file_mtime_ns: int):
-    del file_size, file_mtime_ns
+def _probe_media_streams_cached(file_path: str, file_size: int, file_mtime_ns: int, file_device: int, file_inode: int):
+    del file_size, file_mtime_ns, file_device, file_inode
 
     audio_tracks = []
     audio_languages = []
@@ -2397,9 +2802,10 @@ def _probe_media_streams_cached(file_path: str, file_size: int, file_mtime_ns: i
             elif stream_type == "subtitle":
                 subtitle_languages.append(language)
     except ffmpeg.Error as e:
-        logging.error(f"FFmpeg error: {e.stderr}")
+        error_details = getattr(e, "stderr", None) or str(e)
+        raise RuntimeError(f"FFmpeg could not probe media streams for {file_path}: {error_details}") from e
     except Exception as e:
-        logging.error(f"An error occurred while probing stream metadata for {file_path}: {str(e)}")
+        raise RuntimeError(f"Could not probe media stream metadata for {file_path}: {e}") from e
 
     return {
         "audio_tracks": audio_tracks,
@@ -2411,13 +2817,6 @@ def _probe_media_streams_cached(file_path: str, file_size: int, file_mtime_ns: i
 
 def _probe_media_streams(file_path: str):
     signature = _media_probe_signature(file_path)
-    if signature is None:
-        return {
-            "audio_tracks": [],
-            "audio_languages": [],
-            "subtitle_languages": [],
-            "has_audio": False,
-        }
     return _probe_media_streams_cached(*signature)
 
 
@@ -2475,43 +2874,13 @@ def find_default_audio_track_language(audio_tracks):
     return None
     
 def gen_subtitles_queue(file_path: str, transcription_type: str, force_language: LanguageCode = LanguageCode.NONE, **task_kwargs) -> bool:
-    global task_queue
-
-    # Check if this file is already in the queue or being processed
-    if task_queue.is_active(file_path):
-        logging.debug(f"Ignored: {os.path.basename(file_path)} is already queued or processing.")
-        return False
-
-    if not has_audio(file_path):
-        logging.debug(f"{file_path} doesn't have any audio to transcribe!")
-        return False
-
-    # Probe audio tracks once and pass to both helpers to avoid triple ffprobe
-    audio_tracks = get_audio_tracks(file_path)
-    audio_langs = [track['language'] for track in audio_tracks]
-
-    force_language = choose_transcribe_language(file_path, force_language, audio_tracks=audio_tracks)
-
-    if should_skip_file(file_path, force_language, audio_langs=audio_langs):
-        return False
-
-    # Detect audio language via Whisper if no language is known and detection is enabled
-    if not force_language and should_whisper_detect_audio_language:
-        detect_task = {'path': file_path, 'type': "detect_language"}
-        detect_task.update(task_kwargs)
-        task_queue.put(detect_task)
-        return True
-
-    task = {
-        'path': file_path,
-        'transcribe_or_translate': transcription_type,
-        'force_language': force_language,
-        'audio_tracks': audio_tracks,  # cached — avoids re-probing in gen_subtitles
-    }
-    task.update(task_kwargs)
-
-    task_queue.put(task)
-    return True
+    result = enqueue_media_job(
+        file_path,
+        transcription_type,
+        force_language=force_language,
+        **task_kwargs,
+    )
+    return result.get("status") in {"queued", "promoted"}
 
 def should_skip_file(
     file_path: str,
@@ -2543,16 +2912,16 @@ def should_skip_file(
     if is_audio_file_extension(file_ext) and lrc_for_audio_files:
         lrc_path = os.path.join(os.path.dirname(file_path), f"{file_name}.lrc")
         if os.path.exists(lrc_path):
-            logging.info(f"Skipping {base_name}: LRC file already exists.")
+            log_skip_detail(f"Skipping {base_name}: LRC file already exists.")
             return True
 
     # 2. Audio language is unknown — two independent skip conditions for this case.
     if target_language == LanguageCode.NONE:
         if skip_unknown_language:
-            logging.info(f"Skipping {base_name}: Audio language unknown and SKIP_UNKNOWN_LANGUAGE is enabled.")
+            log_skip_detail(f"Skipping {base_name}: Audio language unknown and SKIP_UNKNOWN_LANGUAGE is enabled.")
             return True
         if skip_if_no_audio_language_but_subtitles_exist and get_subtitle_languages(file_path):
-            logging.info(f"Skipping {base_name}: Audio language unknown but internal subtitles already exist.")
+            log_skip_detail(f"Skipping {base_name}: Audio language unknown but internal subtitles already exist.")
             return True
 
     # 3. Audio track checks (cheap — audio_langs pre-fetched by caller).
@@ -2563,12 +2932,12 @@ def should_skip_file(
     if limit_to_preferred_audio_languages:
         if not any(lang in preferred_audio_languages for lang in audio_langs):
             preferred_names = [lang.to_name() for lang in preferred_audio_languages]
-            logging.info(f"Skipping {base_name}: No preferred audio tracks found (looking for {', '.join(preferred_names)})")
+            log_skip_detail(f"Skipping {base_name}: No preferred audio tracks found (looking for {', '.join(preferred_names)})")
             return True
 
     # 3b. Skip if audio language is in the explicit skip list.
     if any(lang in skip_audio_languages for lang in audio_langs):
-        logging.info(f"Skipping {base_name}: Contains a skipped audio language.")
+        log_skip_detail(f"Skipping {base_name}: Contains a skipped audio language.")
         return True
 
     # 4. Skip if a subtitle already exists in the target language.
@@ -2582,7 +2951,7 @@ def should_skip_file(
                 external_lang,
                 only_match_subgen_subtitles=only_match_subgen_subtitles,
             ):
-                logging.info(f"Skipping {base_name}: Subtitles already exist in custom name '{subtitle_language_name}'.")
+                log_skip_detail(f"Skipping {base_name}: Subtitles already exist in custom name '{subtitle_language_name}'.")
                 return True
 
         # When audio language is unknown but SUBTITLE_LANGUAGE_NAME is explicitly set, we know
@@ -2601,10 +2970,10 @@ def should_skip_file(
                 has_matching_subtitle = subtitle_exists_in_language(file_path, target_language)
             if has_matching_subtitle:
                 if target_language == LanguageCode.NONE:
-                    logging.info(f"Skipping {base_name}: Subtitles already exist and audio language could not be detected from file metadata.")
+                    log_skip_detail(f"Skipping {base_name}: Subtitles already exist and audio language could not be detected from file metadata.")
                 else:
                     lang_name = target_language.to_name()
-                    logging.info(f"Skipping {base_name}: Subtitles already exist in {lang_name}.")
+                    log_skip_detail(f"Skipping {base_name}: Subtitles already exist in {lang_name}.")
                 return True
 
         # Since SUBTITLE_LANGUAGE_NAME overrides the output filename, check if it exists in the folder.
@@ -2624,13 +2993,13 @@ def should_skip_file(
                 )
             )
             if has_named_external_subtitle:
-                logging.info(f"Skipping {base_name}: Subtitles already exist in custom name '{subtitle_language_name}'.")
+                log_skip_detail(f"Skipping {base_name}: Subtitles already exist in custom name '{subtitle_language_name}'.")
                 return True
 
         # Check: Does the exact file Subgen intends to create already exist?
         expected_output = name_subtitle(file_path, target_language)
         if _known_output_path_exists(expected_output, subtitle_rows) or os.path.exists(expected_output):
-            logging.info(f"Skipping {base_name}: Generated subtitle '{os.path.basename(expected_output)}' already exists.")
+            log_skip_detail(f"Skipping {base_name}: Generated subtitle '{os.path.basename(expected_output)}' already exists.")
             return True
 
     # 5. Internal subtitle checks (grouped — both examine streams inside the container).
@@ -2638,12 +3007,12 @@ def should_skip_file(
     # 5a. Skip if an internal subtitle exists in the specifically configured language.
     if skip_if_internal_sub_language and has_internal_subtitle_in_language(file_path, skip_if_internal_sub_language):
         lang_name = skip_if_internal_sub_language.to_name()
-        logging.info(f"Skipping {base_name}: Internal subtitles in {lang_name} already exist.")
+        log_skip_detail(f"Skipping {base_name}: Internal subtitles in {lang_name} already exist.")
         return True
 
     # 5b. Skip if any embedded subtitle language is in the skip list.
     if skip_subtitle_languages and any(lang in skip_subtitle_languages for lang in get_subtitle_languages(file_path)):
-        logging.info(f"Skipping {base_name}: Contains a skipped subtitle language.")
+        log_skip_detail(f"Skipping {base_name}: Contains a skipped subtitle language.")
         return True
 
     # 6. Skip if an external subtitle exists matching the custom subtitle_language_name.
@@ -2667,7 +3036,7 @@ def should_skip_file(
         )
         if has_named_external_subtitle:
             lang_name = external_lang.to_name()
-            logging.info(f"Skipping {base_name}: External subtitles in {lang_name} already exist.")
+            log_skip_detail(f"Skipping {base_name}: External subtitles in {lang_name} already exist.")
             return True
 
     return False
@@ -3127,6 +3496,10 @@ class NewFileHandler(FileSystemEventHandler):
 
     def handle_event(self, event):
         """Wait for file stability before processing."""
+        marker = find_skip_marker(event.src_path, is_directory=os.path.isdir(event.src_path))
+        if marker:
+            logging.debug("Ignoring watched file beneath skip marker %s: %s", marker, event.src_path)
+            return
         if is_file_stable(event.src_path):
             self.create_subtitle(event)
 
@@ -3138,7 +3511,12 @@ class NewFileHandler(FileSystemEventHandler):
         self.handle_event(event)
 
 
-def transcribe_existing(transcribe_folders, forceLanguage: LanguageCode = LanguageCode.NONE):
+def transcribe_existing(
+    transcribe_folders,
+    forceLanguage: LanguageCode = LanguageCode.NONE,
+    *,
+    automatic_startup: bool = False,
+):
     def _run_forced_language_scan(folder_spec: str, forced_language: LanguageCode):
         package_run_with_startup_scan_lock(
             package_forced_startup_scan_existing,
@@ -3156,11 +3534,11 @@ def transcribe_existing(transcribe_folders, forceLanguage: LanguageCode = Langua
             retain_observer=package_retain_startup_scan_observer,
         )
 
-    transcribe_existing_dispatch(
+    return transcribe_existing_dispatch(
         transcribe_folders,
         forceLanguage,
         language_code_none=LanguageCode.NONE,
-        get_backend=_get_startup_scan_backend,
+        get_backend=lambda: _get_startup_scan_backend(honor_skip_setting=automatic_startup),
         initialize=startup_scan_initialize,
         run_forced_language_scan=_run_forced_language_scan,
     )

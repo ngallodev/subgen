@@ -1,13 +1,15 @@
 import sqlite3
 
-
-SCHEMA_VERSION = "3"
+SCHEMA_VERSION = "4"
 
 MEDIA_FILE_COLUMNS = {
     "path": "TEXT PRIMARY KEY",
     "source_path": "TEXT",
     "size": "INTEGER NOT NULL",
     "mtime": "INTEGER NOT NULL",
+    "mtime_ns": "INTEGER",
+    "device": "INTEGER",
+    "inode": "INTEGER",
     "subtitle_signature": "TEXT NOT NULL DEFAULT ''",
     "has_audio": "INTEGER NOT NULL DEFAULT 0",
     "audio_language": "TEXT",
@@ -79,6 +81,9 @@ def ensure_startup_scan_schema(conn: sqlite3.Connection) -> None:
           source_path TEXT,
           size INTEGER NOT NULL,
           mtime INTEGER NOT NULL,
+          mtime_ns INTEGER,
+          device INTEGER,
+          inode INTEGER,
           subtitle_signature TEXT NOT NULL DEFAULT '',
           has_audio INTEGER NOT NULL DEFAULT 0,
           audio_language TEXT,

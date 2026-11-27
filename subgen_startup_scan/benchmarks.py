@@ -9,6 +9,7 @@ from typing import Any
 
 from .config import get_startup_scan_benchmark_log_path, get_startup_scan_benchmark_logging
 
+
 def __getattr__(name: str):
     if name == "BENCHMARK_LOG_PATH":
         return get_startup_scan_benchmark_log_path()
@@ -86,6 +87,9 @@ class BenchmarkLogger:
 @contextmanager
 def benchmark_step(event: str, logger: BenchmarkLogger | None = None, **fields):
     logger = logger or BenchmarkLogger()
+    if not logger.enabled:
+        yield
+        return
     started_at = time.perf_counter()
     try:
         yield

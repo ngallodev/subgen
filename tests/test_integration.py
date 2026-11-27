@@ -34,12 +34,14 @@ def client():
 
 class TestTautulliQueuesTask:
     def test_webhook_results_in_queued_task(self, client, monkeypatch, reset_queue):
+        submitted = []
         monkeypatch.setattr(subgen, "procaddedmedia", True)
         # Prevent has_audio() from touching the file system
         monkeypatch.setattr(subgen, "has_audio", lambda path: True)
         monkeypatch.setattr(subgen, "should_skip_file", lambda path, lang, audio_langs=None: False)
         monkeypatch.setattr(subgen, "choose_transcribe_language", lambda path, lang, audio_tracks=None: lang)
         monkeypatch.setattr(subgen, "should_whisper_detect_audio_language", False)
+        monkeypatch.setattr(subgen, "gen_subtitles_queue", lambda path, *args, **kwargs: submitted.append(path) or True)
 
         client.post(
             "/tautulli",
@@ -47,15 +49,13 @@ class TestTautulliQueuesTask:
             json={"event": "added", "file": "/media/show.mkv"},
         )
 
-        # Give the synchronous handler a moment then check queue
-        queued = reset_queue.get_queued_tasks()
-        assert len(queued) == 1
-        assert "/media/show.mkv" in queued[0]
+        assert submitted == ["/media/show.mkv"]
 
 
 class TestPathMappingApplied:
     def test_container_path_is_remapped(self, client, monkeypatch, reset_queue):
         """Container path /tv → host path /Volumes/TV must be applied before queuing."""
+        submitted = []
         monkeypatch.setattr(subgen, "procaddedmedia", True)
         monkeypatch.setattr(subgen, "use_path_mapping", True)
         monkeypatch.setattr(subgen, "path_mapping_from", "/tv")
@@ -64,6 +64,7 @@ class TestPathMappingApplied:
         monkeypatch.setattr(subgen, "should_skip_file", lambda path, lang, audio_langs=None: False)
         monkeypatch.setattr(subgen, "choose_transcribe_language", lambda path, lang, audio_tracks=None: lang)
         monkeypatch.setattr(subgen, "should_whisper_detect_audio_language", False)
+        monkeypatch.setattr(subgen, "gen_subtitles_queue", lambda path, *args, **kwargs: submitted.append(path) or True)
 
         client.post(
             "/tautulli",
@@ -71,22 +72,20 @@ class TestPathMappingApplied:
             json={"event": "added", "file": "/tv/show.mkv"},
         )
 
-        queued = reset_queue.get_queued_tasks()
-        assert len(queued) == 1
-        assert "/Volumes/TV/show.mkv" in queued[0]
+        assert submitted == ["/Volumes/TV/show.mkv"]
 
 
 class TestEmbyQueuesTask:
     def test_emby_library_new_adds_to_queue(self, client, monkeypatch, reset_queue):
+        submitted = []
         monkeypatch.setattr(subgen, "procaddedmedia", True)
         monkeypatch.setattr(subgen, "has_audio", lambda path: True)
         monkeypatch.setattr(subgen, "should_skip_file", lambda path, lang, audio_langs=None: False)
         monkeypatch.setattr(subgen, "choose_transcribe_language", lambda path, lang, audio_tracks=None: lang)
         monkeypatch.setattr(subgen, "should_whisper_detect_audio_language", False)
+        monkeypatch.setattr(subgen, "gen_subtitles_queue", lambda path, *args, **kwargs: submitted.append(path) or True)
 
         data = {"Event": "library.new", "Item": {"Path": "/media/movie.mkv"}}
         client.post("/emby", data={"data": json.dumps(data)})
 
-        queued = reset_queue.get_queued_tasks()
-        assert len(queued) == 1
-        assert "/media/movie.mkv" in queued[0]
+        assert submitted == ["/media/movie.mkv"]

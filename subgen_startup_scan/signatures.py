@@ -7,6 +7,14 @@ from collections import defaultdict
 from .inventory import StartupInventory, is_subtitle_file_name
 
 
+def _record_identity(record: dict) -> str:
+    mtime_ns = record.get("mtime_ns", int(record.get("mtime", 0)) * 1_000_000_000)
+    return (
+        f"{record['path']}:{record['size']}:{mtime_ns}:"
+        f"{record.get('device', 0)}:{record.get('inode', 0)}"
+    )
+
+
 def startup_scan_flat_manifest(root_paths, *, has_video_extension, has_audio_extension):
     file_paths = []
     media_entries = []
@@ -25,10 +33,10 @@ def startup_scan_flat_manifest(root_paths, *, has_video_extension, has_audio_ext
                 logging.warning("Could not inspect file %s: %s", path, exc)
                 continue
             if is_subtitle_file_name(name):
-                subtitle_entries.append(f"{path}:{stat_result.st_size}:{int(stat_result.st_mtime)}")
+                subtitle_entries.append(_record_identity({"path": path, "size": stat_result.st_size, "mtime": stat_result.st_mtime, "mtime_ns": getattr(stat_result, "st_mtime_ns", None), "device": getattr(stat_result, "st_dev", 0), "inode": getattr(stat_result, "st_ino", 0)}))
                 subtitle_count += 1
             elif has_video_extension(name) or has_audio_extension(name):
-                media_entries.append(f"{path}:{stat_result.st_size}:{int(stat_result.st_mtime)}")
+                media_entries.append(_record_identity({"path": path, "size": stat_result.st_size, "mtime": stat_result.st_mtime, "mtime_ns": getattr(stat_result, "st_mtime_ns", None), "device": getattr(stat_result, "st_dev", 0), "inode": getattr(stat_result, "st_ino", 0)}))
                 media_count += 1
             continue
         if not os.path.isdir(path):
@@ -42,11 +50,11 @@ def startup_scan_flat_manifest(root_paths, *, has_video_extension, has_audio_ext
                         file_paths.append(entry.path)
                         if is_subtitle_file_name(entry.name):
                             stat_result = entry.stat(follow_symlinks=False)
-                            subtitle_entries.append(f"{entry.path}:{stat_result.st_size}:{int(stat_result.st_mtime)}")
+                            subtitle_entries.append(_record_identity({"path": entry.path, "size": stat_result.st_size, "mtime": stat_result.st_mtime, "mtime_ns": getattr(stat_result, "st_mtime_ns", None), "device": getattr(stat_result, "st_dev", 0), "inode": getattr(stat_result, "st_ino", 0)}))
                             subtitle_count += 1
                         elif has_video_extension(entry.name) or has_audio_extension(entry.name):
                             stat_result = entry.stat(follow_symlinks=False)
-                            media_entries.append(f"{entry.path}:{stat_result.st_size}:{int(stat_result.st_mtime)}")
+                            media_entries.append(_record_identity({"path": entry.path, "size": stat_result.st_size, "mtime": stat_result.st_mtime, "mtime_ns": getattr(stat_result, "st_mtime_ns", None), "device": getattr(stat_result, "st_dev", 0), "inode": getattr(stat_result, "st_ino", 0)}))
                             media_count += 1
                     except OSError as exc:
                         logging.warning("Could not inspect %s: %s", entry.path, exc)
@@ -85,6 +93,9 @@ def startup_scan_collect_flat_media_records(root_paths, *, has_video_extension, 
                     "stem": os.path.splitext(name)[0],
                     "size": stat_result.st_size,
                     "mtime": int(stat_result.st_mtime),
+                    "mtime_ns": int(getattr(stat_result, "st_mtime_ns", int(stat_result.st_mtime * 1_000_000_000))),
+                    "device": int(getattr(stat_result, "st_dev", 0)),
+                    "inode": int(getattr(stat_result, "st_ino", 0)),
                 })
             continue
         if not os.path.isdir(path):
@@ -105,6 +116,9 @@ def startup_scan_collect_flat_media_records(root_paths, *, has_video_extension, 
                             "stem": os.path.splitext(entry.name)[0],
                             "size": stat_result.st_size,
                             "mtime": int(stat_result.st_mtime),
+                            "mtime_ns": int(getattr(stat_result, "st_mtime_ns", int(stat_result.st_mtime * 1_000_000_000))),
+                            "device": int(getattr(stat_result, "st_dev", 0)),
+                            "inode": int(getattr(stat_result, "st_ino", 0)),
                         })
                     except OSError as exc:
                         logging.warning("Could not inspect %s: %s", entry.path, exc)
@@ -126,8 +140,8 @@ def startup_scan_build_flat_inventory(media_records: list, subtitle_records: lis
 
 
 def startup_scan_inventory_signature(inventory: StartupInventory, policy_signature: str):
-    media_entries = [f"{record['path']}:{record['size']}:{record['mtime']}" for record in inventory.media_files]
-    subtitle_entries = [f"{record['path']}:{record['size']}:{record['mtime']}" for record in inventory.subtitle_files]
+    media_entries = [_record_identity(record) for record in inventory.media_files]
+    subtitle_entries = [_record_identity(record) for record in inventory.subtitle_files]
     return {
         "file_count": len(media_entries) + len(subtitle_entries),
         "manifest": hashlib.sha1("\n".join(sorted(media_entries + subtitle_entries)).encode("utf-8")).hexdigest(),
@@ -190,6 +204,6 @@ def compute_subtitle_signature(media_path: str, inventory: StartupInventory, cac
         if not subtitle_stem.startswith(media_stem):
             break
         subtitle = subtitle_records[index]
-        matching.append(f"{subtitle['path']}:{subtitle['size']}:{subtitle['mtime']}")
+        matching.append(_record_identity(subtitle))
     payload = "\n".join(sorted(matching)).encode("utf-8")
     return hashlib.sha1(payload).hexdigest(), matching

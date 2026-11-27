@@ -25,6 +25,15 @@ def get_startup_scan_benchmark_logging(default: bool = False) -> bool:
     return _get_env_flag("STARTUP_SCAN_BENCHMARK_LOGGING", default)
 
 
+def get_startup_scan_benchmark(default: bool = False) -> bool:
+    """Return whether startup-scan benchmark collection is explicitly enabled."""
+    return _get_env_flag("STARTUP_SCAN_BENCHMARK", default)
+
+
+def get_startup_scan_benchmark_include_policy(default: bool = False) -> bool:
+    return _get_env_flag("STARTUP_SCAN_BENCHMARK_INCLUDE_POLICY", default)
+
+
 def get_startup_scan_planner_trace_logging(default: bool = False) -> bool:
     return _get_env_flag("STARTUP_SCAN_PLANNER_TRACE_LOGGING", default)
 

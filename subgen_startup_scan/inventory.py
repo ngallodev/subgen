@@ -2,7 +2,7 @@ import json
 import logging
 import os
 from collections import defaultdict
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from .inventory_cache import (
     build_directory_state_payload,
@@ -14,8 +14,8 @@ from .inventory_cache import (
     store_directory_state,
     update_directory_state_cache,
 )
+from .roots import find_skip_marker
 from .traversal import build_record, list_directory_entries, scan_directory_records
-
 
 SUBTITLE_EXTENSIONS = {".srt", ".vtt", ".sub", ".ass", ".ssa", ".idx", ".sbv", ".pgs", ".ttml", ".lrc"}
 
@@ -26,6 +26,10 @@ class StartupInventory:
     subtitle_files: list
     subtitle_files_by_dir: dict
     child_dirs_by_dir: dict
+    root_results: list[dict] = field(default_factory=list)
+    scan_errors: list[dict] = field(default_factory=list)
+    skipped_roots: list[str] = field(default_factory=list)
+    directories: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -40,6 +44,8 @@ class InventoryBuildState:
     has_audio_extension: object
     enrich_subtitle_records: object
     json_default: object
+    use_directory_cache: bool = True
+    scan_errors: list[dict] = field(default_factory=list)
     cache_hits: int = 0
     cache_misses: int = 0
     directory_stat_count: int = 0
@@ -65,6 +71,10 @@ def _preload_directory_state_cache(*, recursive: bool, db) -> dict | None:
     except Exception as exc:
         logging.warning("Could not preload cached directory state: %s", exc)
         return None
+
+
+def _record_inventory_error(state: InventoryBuildState, path: str, exc: Exception) -> None:
+    state.scan_errors.append({"path": path, "error": str(exc)})
 
 
 def _index_media_records(state: InventoryBuildState, media_records: list[dict]) -> None:
@@ -225,6 +235,7 @@ def _try_signature_match_reuse(
         )
     except OSError as exc:
         logging.warning("Could not inspect directory %s: %s", root_path, exc)
+        _record_inventory_error(state, root_path, exc)
         state.cache_reason_counts["list_error"] += 1
         return False
 
@@ -266,10 +277,12 @@ def _scan_directory_full(
             is_subtitle_file_name=is_subtitle_file_name,
             has_video_extension=state.has_video_extension,
             has_audio_extension=state.has_audio_extension,
+            errors=state.scan_errors,
         )
         state.file_stat_count += len(media_records) + len(subtitle_records)
     except OSError as exc:
         logging.warning("Could not inspect directory %s: %s", root_path, exc)
+        _record_inventory_error(state, root_path, exc)
         return
 
     _apply_cached_records(state, root_path, child_dirs, media_records, subtitle_records)
@@ -292,6 +305,7 @@ def _scan_single_file(state: InventoryBuildState, path: str) -> None:
         stat_result = os.stat(path)
     except OSError as exc:
         logging.warning("Could not inspect file %s: %s", path, exc)
+        _record_inventory_error(state, path, exc)
         return
     record = build_record(path, file_name=os.path.basename(path), stat_result=stat_result)
     if is_subtitle_file_name(record["name"]):
@@ -311,10 +325,12 @@ def _scan_non_recursive_directory(state: InventoryBuildState, path: str) -> None
             is_subtitle_file_name=is_subtitle_file_name,
             has_video_extension=state.has_video_extension,
             has_audio_extension=state.has_audio_extension,
+            errors=state.scan_errors,
         )
         state.file_stat_count += len(media_records) + len(subtitle_records)
     except OSError as exc:
         logging.warning("Could not inspect directory %s: %s", path, exc)
+        _record_inventory_error(state, path, exc)
         return
     _apply_cached_records(state, path, child_dirs, media_records, subtitle_records)
 
@@ -340,6 +356,7 @@ def collect_startup_inventory(
     has_audio_extension,
     enrich_subtitle_records,
     json_default,
+    use_directory_cache: bool = True,
 ):
     state = InventoryBuildState(
         inventory=StartupInventory(
@@ -352,23 +369,35 @@ def collect_startup_inventory(
         cache_reason_counts=defaultdict(int),
         recursive=recursive,
         db=db,
-        directory_state_cache=_preload_directory_state_cache(recursive=recursive, db=db),
+        directory_state_cache=(
+            _preload_directory_state_cache(recursive=recursive, db=db)
+            if use_directory_cache
+            else None
+        ),
         has_video_extension=has_video_extension,
         has_audio_extension=has_audio_extension,
         enrich_subtitle_records=enrich_subtitle_records,
         json_default=json_default,
+        use_directory_cache=use_directory_cache,
     )
 
     def scan_directory(root_path: str, *, is_root: bool = False) -> None:
+        marker = find_skip_marker(root_path, is_directory=True)
+        if marker:
+            logging.info("Skipping inventory under marker %s (directory %s).", marker, root_path)
+            state.inventory.skipped_roots.append(root_path)
+            return
+        state.inventory.directories.append(root_path)
         try:
             stat_result = os.stat(root_path)
             state.directory_stat_count += 1
         except OSError as exc:
             logging.warning("Could not inspect directory %s: %s", root_path, exc)
+            _record_inventory_error(state, root_path, exc)
             return
 
         cached_state = None
-        if state.db:
+        if state.db and state.use_directory_cache:
             cached_state = (
                 state.directory_state_cache.get(root_path)
                 if state.directory_state_cache is not None
@@ -419,13 +448,41 @@ def collect_startup_inventory(
     for path in root_paths:
         if not path:
             continue
+        error_count_before = len(state.scan_errors)
+        marker = find_skip_marker(path, is_directory=os.path.isdir(path))
+        if marker:
+            logging.info("Skipping configured root under marker %s: %s", marker, path)
+            state.inventory.skipped_roots.append(path)
+            state.inventory.root_results.append({"path": path, "status": "marker_skipped", "error_count": 0})
+            continue
         if os.path.isfile(path):
             _scan_single_file(state, path)
+            state.inventory.root_results.append({
+                "path": path,
+                "status": "error" if len(state.scan_errors) > error_count_before else "success",
+                "error_count": len(state.scan_errors) - error_count_before,
+            })
             continue
         if os.path.isdir(path):
             if state.recursive:
                 scan_directory(path, is_root=True)
             else:
                 _scan_non_recursive_directory(state, path)
+            root_abs = os.path.abspath(path)
+            scope_errors = [
+                error for error in state.scan_errors[error_count_before:]
+                if os.path.commonpath([root_abs, os.path.abspath(error["path"])]) == root_abs
+            ]
+            state.inventory.root_results.append({
+                "path": path,
+                "status": "error" if scope_errors else "success",
+                "error_count": len(scope_errors),
+            })
+            continue
+        exc = FileNotFoundError(f"Configured root does not exist or cannot be accessed: {path}")
+        logging.warning("%s", exc)
+        _record_inventory_error(state, path, exc)
+        state.inventory.root_results.append({"path": path, "status": "error", "error_count": 1})
 
+    state.inventory.scan_errors = list(state.scan_errors)
     return _finalize_inventory(state)

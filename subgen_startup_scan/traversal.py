@@ -14,6 +14,9 @@ def build_record(path: str, *, file_name: str, stat_result) -> dict:
         "stem": os.path.splitext(file_name)[0],
         "size": stat_result.st_size,
         "mtime": int(stat_result.st_mtime),
+        "mtime_ns": int(getattr(stat_result, "st_mtime_ns", int(stat_result.st_mtime * 1_000_000_000))),
+        "device": int(getattr(stat_result, "st_dev", 0)),
+        "inode": int(getattr(stat_result, "st_ino", 0)),
     }
 
 
@@ -22,6 +25,10 @@ def walk_media_tree(root_path: str, *, ignored_dir_names: set[str]):
         entries = sorted(os.scandir(root_path), key=lambda entry: entry.name)
     except OSError as exc:
         logging.warning("Could not scan %s: %s", root_path, exc)
+        return
+
+    if any(entry.name == ".subgen_skip" for entry in entries):
+        logging.info("Skipping directory beneath skip marker: %s", root_path)
         return
 
     for entry in entries:
@@ -121,6 +128,7 @@ def scan_directory_records(
     is_subtitle_file_name,
     has_video_extension,
     has_audio_extension,
+    errors: list[dict] | None = None,
 ):
     child_dirs = []
     media_records = []
@@ -132,19 +140,21 @@ def scan_directory_records(
                 if entry.is_dir(follow_symlinks=False):
                     child_dirs.append(entry.path)
                     continue
+                relevant_subtitle = is_subtitle_file_name(entry.name)
+                relevant_media = has_video_extension(entry.name) or has_audio_extension(entry.name)
+                if not (relevant_subtitle or relevant_media):
+                    continue
                 if not entry.is_file(follow_symlinks=False):
                     continue
                 stat_result = entry.stat(follow_symlinks=False)
                 record = build_record(entry.path, file_name=entry.name, stat_result=stat_result)
-                if is_subtitle_file_name(entry.name):
+                if relevant_subtitle:
                     subtitle_records.append(record)
-                elif is_media_candidate(
-                    entry.name,
-                    has_video_extension=has_video_extension,
-                    has_audio_extension=has_audio_extension,
-                ):
+                elif relevant_media:
                     media_records.append(record)
             except OSError as exc:
                 logging.warning("Could not inspect %s: %s", entry.path, exc)
+                if errors is not None:
+                    errors.append({"path": entry.path, "error": str(exc)})
 
     return child_dirs, media_records, subtitle_records

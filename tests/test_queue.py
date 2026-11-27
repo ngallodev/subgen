@@ -148,11 +148,11 @@ class TestForceQueueing:
 
         put_calls = []
 
-        def fake_put(item, block=True, timeout=None, force=False):
+        def fake_put_with_result(item, block=True, timeout=None, force=False):
             put_calls.append(force)
-            return True
+            return {"queued": True, "status": "queued", "job_id": "test-job"}
 
-        monkeypatch.setattr(subgen.task_queue, "put", fake_put)
+        monkeypatch.setattr(subgen.task_queue, "put_with_result", fake_put_with_result)
 
         result = subgen.enqueue_media_job(
             video,

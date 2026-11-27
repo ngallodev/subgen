@@ -33,20 +33,23 @@ from language_code import LanguageCode
 # Bug 1: get_subtitle_languages() unhandled exception
 # ---------------------------------------------------------------------------
 class TestGetSubtitleLanguagesException:
-    def test_returns_empty_list_on_av_error(self, monkeypatch):
+    def test_returns_empty_list_on_av_error(self, monkeypatch, tmp_path):
         """
         If av.open() raises (corrupt file, permissions, wrong format),
         get_subtitle_languages() must return [] instead of propagating.
         """
         import av as av_mock
         av_mock.open.side_effect = Exception("corrupt file")
+        media_file = tmp_path / "corrupt.mkv"
+        media_file.write_bytes(b"fixture")
+        monkeypatch.setattr(subgen.ffmpeg, "probe", lambda _path: {"streams": []})
 
-        result = get_subtitle_languages("/fake/corrupt.mkv")
+        result = get_subtitle_languages(str(media_file))
         assert result == [], (
             "get_subtitle_languages() should return [] on exception, not propagate"
         )
 
-    def test_still_returns_languages_on_success(self, monkeypatch):
+    def test_still_returns_languages_on_success(self, monkeypatch, tmp_path):
         """Happy path: still returns languages when av.open works."""
         stream = MagicMock()
         stream.metadata = {"language": "eng"}
@@ -58,8 +61,15 @@ class TestGetSubtitleLanguagesException:
         import av as av_mock
         av_mock.open.side_effect = None
         av_mock.open.return_value = container
+        media_file = tmp_path / "good.mkv"
+        media_file.write_bytes(b"fixture")
+        monkeypatch.setattr(
+            subgen.ffmpeg,
+            "probe",
+            lambda _path: {"streams": [{"codec_type": "subtitle", "tags": {"language": "eng"}}]},
+        )
 
-        result = get_subtitle_languages("/fake/good.mkv")
+        result = get_subtitle_languages(str(media_file))
         assert LanguageCode.ENGLISH in result
 
 

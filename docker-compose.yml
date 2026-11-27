@@ -34,8 +34,10 @@ services:
       USE_MODEL_PROMPT: "False"
       MONITOR: "True"
       NAMESUBLANG: aa
+      STARTUP_SCAN_BACKEND: ${STARTUP_SCAN_BACKEND:-legacy}
       STARTUP_SCAN_DB_PATH: "/subgen/state/subgen_scan.db"
-      STARTUP_SCAN_BENCHMARK_LOGGING: "True"
+      STARTUP_SCAN_BENCHMARK: "False"
+      STARTUP_SCAN_BENCHMARK_LOGGING: "False"
       STARTUP_SCAN_BENCHMARK_LOG_PATH: "/subgen/state/startup_scan_benchmarks.jsonl"
       XDG_CACHE_HOME: /cache
       HF_HOME: /cache/huggingface

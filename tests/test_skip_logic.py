@@ -318,13 +318,13 @@ class TestSkipStartupScan:
             "the flag belongs at the lifespan call site so /batch still works"
         )
 
-    def test_lifespan_skips_thread_when_skip_enabled(self, monkeypatch, tmp_path):
-        """With SKIP_STARTUP_SCAN=True, lifespan must not spawn the scan thread."""
+    def test_lifespan_delegates_skip_and_monitor_setup(self, monkeypatch, tmp_path):
+        """The startup service owns skipping enumeration while retaining monitor setup."""
         monkeypatch.setattr(subgen, "transcribe_folders", str(tmp_path))
         monkeypatch.setattr(subgen, "skip_startup_scan", True)
 
         spawned = []
-        monkeypatch.setattr(subgen, "transcribe_existing", lambda *a, **k: spawned.append(a))
+        monkeypatch.setattr(subgen, "transcribe_existing", lambda *a, **k: spawned.append((a, k)))
 
         import threading as _threading
         original_thread = _threading.Thread
@@ -343,9 +343,9 @@ class TestSkipStartupScan:
                     pass
             asyncio.run(run())
 
-        assert subgen.transcribe_existing not in [fn for fn in threads_started], (
-            "lifespan must not start the scan thread when SKIP_STARTUP_SCAN=True"
-        )
+        assert subgen.transcribe_existing in threads_started
+        assert len(spawned) == 1
+        assert spawned[0][1]["automatic_startup"] is True
 
     def test_lifespan_starts_thread_when_skip_disabled(self, monkeypatch, tmp_path):
         """With SKIP_STARTUP_SCAN=False, lifespan must spawn the scan thread."""

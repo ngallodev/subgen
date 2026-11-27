@@ -1,12 +1,21 @@
 import json
 import logging
 import os
+import sqlite3
+import threading
 import time
 from types import SimpleNamespace
 
-from .association import current_sidecar_state
-from .association import enrich_subtitle_records
 from language_code import LanguageCode
+
+from .association import current_sidecar_state, enrich_subtitle_records
+
+_startup_cache_write_lock = threading.Lock()
+_STARTUP_CACHE_WRITE_RETRIES = 4
+
+
+def _is_sqlite_lock_error(exc: Exception) -> bool:
+    return isinstance(exc, sqlite3.OperationalError) and "locked" in str(exc).lower()
 
 
 def startup_scan_probe_cache_info():
@@ -38,7 +47,18 @@ def startup_scan_get_subtitle_rows(conn, media_path: str):
     return [dict(row) for row in rows]
 
 
-def startup_scan_record_media(conn, path: str, size: int, mtime: int, has_audio: bool, audio_language, subtitle_state: str, decision: str, reason: str, last_seen: int) -> None:
+def startup_scan_record_media(
+    conn,
+    path: str,
+    size: int,
+    mtime: int,
+    has_audio: bool,
+    audio_language,
+    subtitle_state: str,
+    decision: str,
+    reason: str,
+    last_seen: int,
+) -> None:
     conn.execute(
         """
         INSERT INTO media_files(path, size, mtime, has_audio, audio_language, subtitle_state, decision, reason, last_seen)
@@ -83,7 +103,16 @@ def startup_scan_record_excluded(conn, path: str, size: int, mtime: int, reason:
     )
 
 
-def startup_scan_record_subtitle(conn, path: str, size: int, mtime: int, media_path: str, subtitle_type: str, language, last_seen: int) -> None:
+def startup_scan_record_subtitle(
+    conn,
+    path: str,
+    size: int,
+    mtime: int,
+    media_path: str,
+    subtitle_type: str,
+    language,
+    last_seen: int,
+) -> None:
     conn.execute(
         """
         INSERT INTO subtitle_files(path, size, mtime, media_path, subtitle_type, language, last_seen)
@@ -176,6 +205,8 @@ def refresh_processed_file(
     get_startup_policy_signature,
     db_factory,
     startup_scan_db_path: str,
+    generated_output_path: str | None = None,
+    generated_output_language=None,
 ) -> None:
     if not os.path.exists(path):
         return
@@ -196,12 +227,24 @@ def refresh_processed_file(
         audio_tracks=normalized_audio_tracks,
     )
     source_path = path_mapping(path)
-    subtitle_path = name_subtitle(
+    subtitle_path = generated_output_path or name_subtitle(
         path,
         resolved_audio_language if resolved_audio_language != language_code.NONE else language_code.ENGLISH,
+        transcription_type=transcription_type,
     )
-    subtitle_state = "generated" if os.path.exists(subtitle_path) else "unknown"
+    try:
+        subtitle_stat = os.stat(subtitle_path)
+        subtitle_state = "generated" if os.path.isfile(subtitle_path) else "unknown"
+    except OSError:
+        subtitle_stat = None
+        subtitle_state = "unknown"
+    if generated_output_path and subtitle_state != "generated":
+        logging.error("Generated subtitle is missing or not a regular file: %s", subtitle_path)
+        return
     audio_language = resolved_audio_language.to_iso_639_2_t() if resolved_audio_language else ""
+    output_language = generated_output_language or resolved_audio_language
+    if isinstance(output_language, str):
+        output_language = language_code.from_string(output_language)
     audio_langs = [
         track["language"].to_iso_639_2_t() if track.get("language") else ""
         for track in normalized_audio_tracks
@@ -211,46 +254,60 @@ def refresh_processed_file(
     subtitle_signature, _ = compute_subtitle_signature(path, subtitle_inventory, {})
 
     try:
-        db = db_factory(startup_scan_db_path)
-        try:
-            db.begin()
-            db.upsert_media(
-                path=source_path,
-                source_path=path,
-                size=stat_result.st_size,
-                mtime=int(stat_result.st_mtime),
-                subtitle_signature=subtitle_signature,
-                has_audio=bool(normalized_audio_tracks),
-                audio_language=audio_language,
-                subtitle_state=subtitle_state,
-                decision="eligible",
-                reason="completed",
-                policy_signature=policy_signature,
-                task_type="transcribe" if transcription_type != "translate" else "translate",
-                transcription_type=transcription_type,
-                force_language_code=resolved_audio_language.to_iso_639_2_t() if resolved_audio_language else "",
-                audio_tracks_json=json.dumps(
-                    normalized_audio_tracks,
-                    default=lambda value: json_default(value, language_code=language_code),
-                ),
-                audio_langs_json=json.dumps(audio_langs),
-            )
-            db.upsert_subtitle(
-                path=subtitle_path,
-                source_path=subtitle_path,
-                size=os.path.getsize(subtitle_path) if os.path.exists(subtitle_path) else 0,
-                mtime=int(os.path.getmtime(subtitle_path)) if os.path.exists(subtitle_path) else int(stat_result.st_mtime),
-                media_path=path,
-                subtitle_type="generated",
-                language=resolved_audio_language.to_iso_639_2_t() if resolved_audio_language else None,
-            )
-            db.set_meta("flat_inventory_policy_signature", policy_signature)
-            db.commit()
-        except Exception:
-            db.rollback()
-            raise
-        finally:
-            db.close()
+        with _startup_cache_write_lock:
+            for attempt in range(_STARTUP_CACHE_WRITE_RETRIES + 1):
+                db = None
+                try:
+                    db = db_factory(startup_scan_db_path)
+                    db.begin()
+                    db.upsert_media(
+                        path=source_path,
+                        source_path=path,
+                        size=stat_result.st_size,
+                        mtime=int(stat_result.st_mtime),
+                        mtime_ns=getattr(stat_result, "st_mtime_ns", None),
+                        device=getattr(stat_result, "st_dev", None),
+                        inode=getattr(stat_result, "st_ino", None),
+                        subtitle_signature=subtitle_signature,
+                        has_audio=bool(normalized_audio_tracks),
+                        audio_language=audio_language,
+                        subtitle_state=subtitle_state,
+                        decision="eligible",
+                        reason="completed",
+                        policy_signature=policy_signature,
+                        task_type="transcribe" if transcription_type != "translate" else "translate",
+                        transcription_type=transcription_type,
+                        force_language_code=resolved_audio_language.to_iso_639_2_t() if resolved_audio_language else "",
+                        audio_tracks_json=json.dumps(
+                            normalized_audio_tracks,
+                            default=lambda value: json_default(value, language_code=language_code),
+                        ),
+                        audio_langs_json=json.dumps(audio_langs),
+                    )
+                    db.upsert_subtitle(
+                        path=subtitle_path,
+                        source_path=subtitle_path,
+                        size=subtitle_stat.st_size if subtitle_stat else 0,
+                        mtime=int(subtitle_stat.st_mtime) if subtitle_stat else int(stat_result.st_mtime),
+                        media_path=path,
+                        subtitle_type="generated",
+                         language=output_language.to_iso_639_2_t() if output_language else None,
+                    )
+                    db.set_meta("flat_inventory_policy_signature", policy_signature)
+                    db.commit()
+                    break
+                except Exception as exc:
+                    if db is not None:
+                        try:
+                            db.rollback()
+                        except Exception:
+                            pass
+                    if not _is_sqlite_lock_error(exc) or attempt >= _STARTUP_CACHE_WRITE_RETRIES:
+                        raise
+                    time.sleep(0.1 * (2**attempt))
+                finally:
+                    if db is not None:
+                        db.close()
     except Exception as exc:
         logging.debug("Could not update startup cache for %s: %s", path, exc)
 
@@ -293,7 +350,7 @@ def startup_scan_process_record(
                 cached_row.get("audio_language"),
                 cached_state,
                 reused_decision,
-                cached_row.get("reason"),
+                cached_row.get("reason") or "cached",
                 startup_scan_now(),
             )
             startup_scan_update_state(
@@ -302,7 +359,7 @@ def startup_scan_process_record(
                 size,
                 mtime,
                 reused_decision,
-                cached_row.get("reason"),
+                cached_row.get("reason") or "cached",
                 startup_scan_now(),
             )
             return "reused"

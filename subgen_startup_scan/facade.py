@@ -3,10 +3,20 @@ from .inventory import is_relevant_inventory_file_name as package_is_relevant_in
 from .inventory import is_subtitle_file_name as package_is_subtitle_file_name
 from .signatures import (
     startup_scan_build_flat_inventory as package_startup_scan_build_flat_inventory,
+)
+from .signatures import (
     startup_scan_collect_flat_media_records as package_startup_scan_collect_flat_media_records,
+)
+from .signatures import (
     startup_scan_flat_manifest as package_startup_scan_flat_manifest,
+)
+from .signatures import (
     startup_scan_inventory_signature as package_startup_scan_inventory_signature,
+)
+from .signatures import (
     startup_scan_inventory_signature_matches as package_startup_scan_inventory_signature_matches,
+)
+from .signatures import (
     startup_scan_store_inventory_signature as package_startup_scan_store_inventory_signature,
 )
 
@@ -32,6 +42,7 @@ def collect_startup_inventory(
     has_audio_extension,
     enrich_subtitle_records,
     json_default,
+    use_directory_cache: bool = True,
 ):
     return package_collect_startup_inventory(
         root_paths,
@@ -41,6 +52,7 @@ def collect_startup_inventory(
         has_audio_extension=has_audio_extension,
         enrich_subtitle_records=enrich_subtitle_records,
         json_default=json_default,
+        use_directory_cache=use_directory_cache,
     )
 
 

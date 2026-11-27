@@ -1,16 +1,20 @@
 """
 Tests for the SQLite-backed startup scan cache.
 """
+import json
 import os
 import sqlite3
 import sys
-import json
 from contextlib import contextmanager
+from types import SimpleNamespace
+
+import pytest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
 import subgen
 from language_code import LanguageCode
+from subgen_startup_scan.classifier import classify_media
 from subgen_startup_scan.classifier import plan_media_record as package_plan_media_record
 from subgen_startup_scan.dependencies import StartupScanDependencies
 
@@ -288,20 +292,21 @@ def test_startup_scan_total_benchmark_wraps_followup_work(monkeypatch, tmp_path)
 
     monkeypatch.setattr(subgen, "BenchmarkLogger", FakeLogger)
     monkeypatch.setattr(subgen, "benchmark_step", fake_benchmark_step)
-    monkeypatch.setattr(subgen, "collect_startup_inventory", lambda folders, recursive=True, db=None: FakeInventory())
+    monkeypatch.setattr(subgen, "collect_startup_inventory", lambda folders, recursive=True, db=None, **kwargs: FakeInventory())
     monkeypatch.setattr(subgen, "StartupScanDB", FakeDB)
     monkeypatch.setattr(subgen, "get_startup_policy_signature", lambda: "sig")
     monkeypatch.setattr(subgen, "monitor", False)
 
     subgen.startup_scan_existing(str(tmp_path))
 
-    assert events[0] == ("enter", "startup_scan.total")
-    assert events[-1] == ("exit", "startup_scan.total")
+    assert ("enter", "startup_scan.total") in events
+    assert ("exit", "startup_scan.total") in events
+    assert events.index(("enter", "startup_scan.total")) < events.index(("exit", "startup_scan.total"))
     assert events.index(("write", "startup_scan.metadata_initialized")) < events.index(("exit", "startup_scan.total"))
     assert events.index(("exit", "startup_scan.monitor_setup")) < events.index(("exit", "startup_scan.total"))
 
 
-def test_startup_scan_shortcuts_when_manifest_matches(monkeypatch, tmp_path):
+def test_startup_scan_reconciles_even_when_manifest_matches(monkeypatch, tmp_path):
     events = []
 
     class FakeLogger:
@@ -336,6 +341,24 @@ def test_startup_scan_shortcuts_when_manifest_matches(monkeypatch, tmp_path):
         def close(self):
             events.append(("close", {}))
 
+        def get_all_subtitles(self):
+            return []
+
+        def get_all_media(self):
+            return []
+
+        def get_all_excluded(self):
+            return []
+
+        def upsert_subtitle(self, **kwargs):
+            pass
+
+        def upsert_excluded(self, **kwargs):
+            pass
+
+        def upsert_media(self, **kwargs):
+            pass
+
     class FakeInventory:
         def __init__(self):
             self.media_files = [{"path": str(tmp_path / "movie.mkv"), "mtime": 1, "size": 1}]
@@ -351,11 +374,22 @@ def test_startup_scan_shortcuts_when_manifest_matches(monkeypatch, tmp_path):
 
     monkeypatch.setattr(subgen, "BenchmarkLogger", FakeLogger)
     monkeypatch.setattr(subgen, "benchmark_step", fake_benchmark_step)
-    monkeypatch.setattr(subgen, "collect_startup_inventory", lambda folders, recursive=True, db=None: FakeInventory())
+    monkeypatch.setattr(subgen, "collect_startup_inventory", lambda folders, recursive=True, db=None, **kwargs: FakeInventory())
     monkeypatch.setattr(subgen, "StartupScanDB", FakeDB)
     monkeypatch.setattr(subgen, "get_startup_policy_signature", lambda: "sig")
     monkeypatch.setattr(subgen, "monitor", False)
     monkeypatch.setattr(subgen, "startup_scan_force_rewalk", False)
+    monkeypatch.setattr(
+        subgen,
+        "_startup_scan_plan_media_record",
+        lambda *args, **kwargs: {
+            "media": args[0], "queue_path": args[1], "cached_row": args[2],
+            "subtitle_rows": args[4], "current_sidecar_state": args[5],
+            "subtitle_signature": "", "matching_subtitles": [],
+            "plan": {"status": "skip", "reason": "test_skip", "details": "test", "audio_tracks": [], "audio_langs": []},
+            "signature_ms": 0.0, "plan_ms": 0.0,
+        },
+    )
 
     db = FakeDB()
     signature = subgen._startup_scan_inventory_signature(FakeInventory(), "sig")
@@ -372,8 +406,8 @@ def test_startup_scan_shortcuts_when_manifest_matches(monkeypatch, tmp_path):
 
     subgen.startup_scan_existing(str(tmp_path))
 
-    assert any(event == "startup_scan.manifest_hit" for event, _ in events)
-    assert not any(event == "startup_scan.classify_media" for event, _ in events)
+    assert any(event == "startup_scan.summary" for event, _ in events)
+    assert not any(event == "startup_scan.manifest_hit" for event, _ in events)
 
 
 def test_startup_scan_manifest_hit_backfills_subtitle_media_links(monkeypatch, tmp_path):
@@ -418,6 +452,18 @@ def test_startup_scan_manifest_hit_backfills_subtitle_media_links(monkeypatch, t
         def upsert_subtitle(self, **kwargs):
             relinked.append(kwargs)
 
+        def get_all_media(self):
+            return []
+
+        def get_all_excluded(self):
+            return []
+
+        def upsert_excluded(self, **kwargs):
+            pass
+
+        def upsert_media(self, **kwargs):
+            pass
+
     class FakeInventory:
         def __init__(self):
             self.media_files = [{"path": str(tmp_path / "movie.mkv"), "mtime": 1, "size": 1}]
@@ -440,10 +486,21 @@ def test_startup_scan_manifest_hit_backfills_subtitle_media_links(monkeypatch, t
 
     monkeypatch.setattr(subgen, "BenchmarkLogger", FakeLogger)
     monkeypatch.setattr(subgen, "benchmark_step", fake_benchmark_step)
-    monkeypatch.setattr(subgen, "collect_startup_inventory", lambda folders, recursive=True, db=None: FakeInventory())
+    monkeypatch.setattr(subgen, "collect_startup_inventory", lambda folders, recursive=True, db=None, **kwargs: FakeInventory())
     monkeypatch.setattr(subgen, "monitor", False)
     monkeypatch.setattr(subgen, "startup_scan_force_rewalk", False)
     monkeypatch.setattr(subgen, "get_startup_policy_signature", lambda: "sig")
+    monkeypatch.setattr(
+        subgen,
+        "_startup_scan_plan_media_record",
+        lambda *args, **kwargs: {
+            "media": args[0], "queue_path": args[1], "cached_row": args[2],
+            "subtitle_rows": args[4], "current_sidecar_state": args[5],
+            "subtitle_signature": "", "matching_subtitles": [],
+            "plan": {"status": "skip", "reason": "test_skip", "details": "test", "audio_tracks": [], "audio_langs": []},
+            "signature_ms": 0.0, "plan_ms": 0.0,
+        },
+    )
 
     db = FakeDB()
     signature = subgen._startup_scan_inventory_signature(FakeInventory(), "sig")
@@ -460,7 +517,7 @@ def test_startup_scan_manifest_hit_backfills_subtitle_media_links(monkeypatch, t
     subgen.startup_scan_existing(str(tmp_path))
 
     assert relinked
-    assert any(event == "startup_scan.subtitle_relink" for event, _ in events)
+    assert any(event == "startup_scan.summary" for event, _ in events)
 
 
 def test_inventory_signature_changes_when_media_mtime_changes(tmp_path):
@@ -575,7 +632,7 @@ def test_startup_scan_subtitle_index_preserves_media_links(monkeypatch, tmp_path
 
     monkeypatch.setattr(subgen, "BenchmarkLogger", FakeLogger)
     monkeypatch.setattr(subgen, "benchmark_step", fake_benchmark_step)
-    monkeypatch.setattr(subgen, "collect_startup_inventory", lambda folders, recursive=True, db=None: FakeInventory())
+    monkeypatch.setattr(subgen, "collect_startup_inventory", lambda folders, recursive=True, db=None, **kwargs: FakeInventory())
     monkeypatch.setattr(subgen, "StartupScanDB", FakeDB)
     monkeypatch.setattr(subgen, "monitor", False)
     monkeypatch.setattr(subgen, "startup_scan_force_rewalk", True)
@@ -724,11 +781,11 @@ def test_refresh_processed_file_persists_audio_languages(monkeypatch, tmp_path):
 
     media = tmp_path / "movie.mkv"
     media.touch()
-    subtitle = tmp_path / "movie.subgen.spa.srt"
+    subtitle = tmp_path / "movie.subgen.eng.srt"
     subtitle.write_text("1\n00:00:00,000 --> 00:00:01,000\nhola\n", encoding="utf-8")
 
     monkeypatch.setattr(subgen, "path_mapping", lambda value: value)
-    monkeypatch.setattr(subgen, "name_subtitle", lambda path, language: str(subtitle))
+    monkeypatch.setattr(subgen, "name_subtitle", lambda path, language, **kwargs: str(subtitle))
 
     audio_tracks = [
         {
@@ -749,6 +806,8 @@ def test_refresh_processed_file_persists_audio_languages(monkeypatch, tmp_path):
         "transcribe",
         LanguageCode.SPANISH,
         audio_tracks=audio_tracks,
+        generated_output_path=str(subtitle),
+        generated_output_language=LanguageCode.ENGLISH,
     )
 
     db = subgen.StartupScanDB(str(db_path))
@@ -761,7 +820,7 @@ def test_refresh_processed_file_persists_audio_languages(monkeypatch, tmp_path):
     assert json.loads(media_row["audio_langs_json"]) == ["spa"]
     assert json.loads(media_row["audio_tracks_json"])[0]["language"] == "spa"
     assert subtitle_rows[0]["media_path"] == str(media)
-    assert subtitle_rows[0]["language"] == "spa"
+    assert subtitle_rows[0]["language"] == "eng"
 
 
 def test_startup_scan_uses_parallel_planning_executor(monkeypatch, tmp_path):
@@ -860,7 +919,7 @@ def test_startup_scan_uses_parallel_planning_executor(monkeypatch, tmp_path):
 
     monkeypatch.setattr(subgen, "BenchmarkLogger", FakeLogger)
     monkeypatch.setattr(subgen, "benchmark_step", fake_benchmark_step)
-    monkeypatch.setattr(subgen, "collect_startup_inventory", lambda folders, recursive=True, db=None: FakeInventory())
+    monkeypatch.setattr(subgen, "collect_startup_inventory", lambda folders, recursive=True, db=None, **kwargs: FakeInventory())
     monkeypatch.setattr(subgen, "StartupScanDB", FakeDB)
     monkeypatch.setattr(subgen, "get_startup_policy_signature", lambda: "sig")
     monkeypatch.setattr(subgen, "monitor", False)
@@ -910,6 +969,170 @@ def test_plan_media_record_defers_signature_when_skip_is_known(monkeypatch):
     assert calls == [("audio_tracks", "/media/movie.mkv")]
 
 
+def test_classify_media_workload_reports_policy_mismatch_reason():
+    events = []
+
+    class FakeLogger:
+        def write(self, event, **fields):
+            events.append((event, fields))
+
+    class FakeDB:
+        def get_all_media(self):
+            return [
+                {
+                    "path": "/media/movie.mkv",
+                    "size": 1,
+                    "mtime": 1,
+                    "policy_signature": "old-policy",
+                    "subtitle_signature": "",
+                    "has_audio": 0,
+                    "audio_language": "",
+                    "subtitle_state": "external",
+                    "decision": "excluded",
+                    "reason": "cached",
+                }
+            ]
+
+        def get_all_excluded(self):
+            return []
+
+        def upsert_excluded(self, **kwargs):
+            return None
+
+        def upsert_media(self, **kwargs):
+            return None
+
+    @contextmanager
+    def fake_benchmark_step(event, logger, **fields):
+        yield
+
+    deps = StartupScanDependencies(
+        startup_scan_force_rewalk=False,
+        startup_scan_classify_workers=1,
+        path_mapping=lambda path: path,
+        current_sidecar_state=lambda rows: "external",
+        probe_cache_info=lambda: SimpleNamespace(hits=0, misses=0, currsize=0, maxsize=0),
+        benchmark_step=fake_benchmark_step,
+        thread_pool_executor_factory=None,
+        startup_scan_planner_trace_logging=False,
+        plan_media_record=lambda media, queue_path, cached_row, inventory, subtitle_rows, current_sidecar_state: {
+            "media": media,
+            "queue_path": queue_path,
+            "cached_row": cached_row,
+            "current_sidecar_state": current_sidecar_state,
+            "subtitle_signature": "",
+            "matching_subtitles": [],
+            "plan": {"status": "skip", "reason": "cached", "details": "cached"},
+            "signature_ms": 0.0,
+            "plan_ms": 0.0,
+            "queue_plan_ms": 0.0,
+        },
+    )
+
+    inventory = type("Inventory", (), {"media_files": [{"path": "/media/movie.mkv", "size": 1, "mtime": 1}]})()
+
+    classify_media(
+        deps,
+        FakeDB(),
+        inventory,
+        subtitle_rows_by_media={},
+        benchmark_logger=FakeLogger(),
+        policy_signature="new-policy",
+    )
+
+    workload_events = [fields for event, fields in events if event == "startup_scan.classify_media.workload"]
+    assert workload_events
+    assert workload_events[-1]["preflight_cache_hits"] == 0
+    assert workload_events[-1]["preflight_cache_misses"] == 1
+    assert workload_events[-1]["media_policy_mismatch"] == 1
+
+
+def test_startup_scan_logs_policy_payload_when_enabled(monkeypatch, tmp_path):
+    events = []
+
+    class FakeLogger:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def write(self, event, **fields):
+            events.append((event, fields))
+
+    class FakeDB:
+        def __init__(self, *args, **kwargs):
+            self.meta = {}
+
+        def get_meta(self, key):
+            return self.meta.get(key)
+
+        def set_meta(self, key, value):
+            self.meta[key] = value
+
+        def count_rows(self, table_name):
+            return 0
+
+        def begin(self):
+            return None
+
+        def commit(self):
+            return None
+
+        def rollback(self):
+            return None
+
+        def close(self):
+            return None
+
+        def get_all_subtitles(self):
+            return []
+
+    class FakeInventory:
+        def __init__(self):
+            self.media_files = []
+            self.subtitle_files = []
+            self.child_dirs_by_dir = {}
+
+    @contextmanager
+    def fake_benchmark_step(event, logger, **fields):
+        yield
+
+    monkeypatch.setattr(subgen, "BenchmarkLogger", FakeLogger)
+    monkeypatch.setattr(subgen, "benchmark_step", fake_benchmark_step)
+    monkeypatch.setattr(subgen, "collect_startup_inventory", lambda folders, recursive=True, db=None, **kwargs: FakeInventory())
+    monkeypatch.setattr(subgen, "StartupScanDB", FakeDB)
+    monkeypatch.setattr(subgen, "get_startup_policy_signature", lambda: "sig")
+    monkeypatch.setattr(
+        subgen,
+        "get_startup_policy_payload",
+        lambda: {
+            "transcribe_or_translate": "translate",
+            "lrc_for_audio_files": True,
+            "skip_unknown_language": False,
+            "skip_if_no_audio_language_but_subtitles_exist": False,
+            "limit_to_preferred_audio_languages": False,
+            "preferred_audio_languages": ["eng"],
+            "skip_audio_languages": [],
+            "skip_if_target_subtitle_exists": False,
+            "subtitle_language_name": "eng",
+            "skip_if_internal_sub_language": "eng",
+            "skip_subtitle_languages": [],
+            "skip_if_external_sub_exists": False,
+            "only_match_subgen_subtitles": False,
+            "force_detected_language_to": "",
+            "should_whisper_detect_audio_language": False,
+        },
+    )
+    monkeypatch.setattr(subgen, "startup_scan_benchmark_include_policy", True)
+    monkeypatch.setattr(subgen, "monitor", False)
+
+    subgen.startup_scan_existing(str(tmp_path))
+
+    payload_events = [fields for event, fields in events if event == "startup_scan.policy_payload"]
+    assert payload_events
+    assert payload_events[-1]["policy_signature"] == "sig"
+    assert payload_events[-1]["transcribe_or_translate"] == "translate"
+    assert payload_events[-1]["preferred_audio_languages"] == ["eng"]
+
+
 def test_plan_media_record_keeps_signature_for_queue_paths(monkeypatch):
     calls = []
 
@@ -939,6 +1162,33 @@ def test_plan_media_record_keeps_signature_for_queue_paths(monkeypatch):
     assert result["plan"]["status"] == "queue"
     assert result["subtitle_signature"] == "sig"
     assert calls == [("signature", "/media/movie.mkv")]
+
+
+@pytest.mark.parametrize("changed_field", [None, "size", "mtime", "mtime_ns", "device", "inode"])
+def test_plan_media_record_only_reuses_tracks_for_matching_source(changed_field):
+    path = "/media/movie.mkv"
+    fingerprint = dict(size=20, mtime=30, mtime_ns=30_000_000_000, device=1, inode=2)
+    cached_row = dict(fingerprint, has_audio=True, audio_tracks_json="cached-tracks", policy_signature="old-policy")
+    media = dict(fingerprint, path=path)
+    if changed_field:
+        media[changed_field] += 1
+    probe_calls = []
+    deps = StartupScanDependencies(
+        task_queue=type("Queue", (), {"is_active": staticmethod(lambda path: False)})(),
+        language_code=LanguageCode,
+        get_audio_tracks=lambda value: probe_calls.append(value) or [{"language": LanguageCode.JAPANESE}],
+        choose_transcribe_language=lambda *args, audio_tracks: audio_tracks[0]["language"],
+        describe_skip_reason=lambda *args, **kwargs: (False, "", ""),
+        transcribe_or_translate="transcribe",
+        deserialize_audio_tracks=lambda value, **kwargs: [{"language": LanguageCode.ENGLISH}],
+        compute_subtitle_signature=lambda *args: ("sig", []),
+        get_startup_policy_signature=lambda: "current-policy",
+    )
+
+    result = package_plan_media_record(deps, media, path, cached_row, object(), [], None)
+
+    assert probe_calls == ([path] if changed_field else [])
+    assert result["plan"]["force_language"] == (LanguageCode.JAPANESE if changed_field else LanguageCode.ENGLISH)
 
 
 def test_plan_media_record_reuses_known_subtitle_rows_for_skip_checks(monkeypatch):

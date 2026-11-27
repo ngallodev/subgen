@@ -1,6 +1,5 @@
 from threading import Lock
 
-
 _startup_scan_db_lock = Lock()
 _startup_scan_observers = []
 

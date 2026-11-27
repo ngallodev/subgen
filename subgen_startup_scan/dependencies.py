@@ -19,9 +19,12 @@ class StartupScanDependencies:
     should_whisper_detect_audio_language: bool = False
     startup_scan_planner_trace_logging: bool = False
     startup_scan_force_rewalk: bool = False
+    skip_startup_scan: bool = False
     startup_scan_classify_workers: int = 1
     startup_scan_benchmark_log_path: str = ""
     startup_scan_benchmark_logging: bool = False
+    startup_scan_benchmark: bool = False
+    startup_scan_benchmark_include_policy: bool = False
     startup_scan_db_path: str = ""
     transcribe_or_translate: str = "transcribe"
     monitor: Any = None
@@ -38,6 +41,7 @@ class StartupScanDependencies:
     inventory_signature_matches: Callable[..., bool] | None = None
     store_inventory_signature: Callable[..., None] | None = None
     get_startup_policy_signature: Callable[[], str] | None = None
+    get_startup_policy_payload: Callable[[], dict[str, Any]] | None = None
     probe_cache_info: Callable[[], Any] | None = None
     benchmark_logger_factory: Callable[..., Any] | None = None
     benchmark_step: Callable[..., Any] | None = None
