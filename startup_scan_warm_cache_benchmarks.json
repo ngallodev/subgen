@@ -1,0 +1,158 @@
+{
+  "format": "startup_scan_warm_cache_benchmarks_v1",
+  "repetitions": 1,
+  "datasets": [
+    {
+      "label": "dataset_1",
+      "status": "complete",
+      "dataset_unchanged": true,
+      "all_cases_worker_free": true,
+      "case_medians": {
+        "default-cold": {
+          "scan_elapsed_ms": 95923.518,
+          "filesystem_elapsed_ms": 0.189,
+          "inventory_elapsed_ms": null,
+          "decision_median_ms": 921.337,
+          "decision_p95_ms": 1859.238,
+          "decision_count_median": 63,
+          "directories_walked": 1,
+          "files_walked": 166,
+          "media_files": 63,
+          "subtitle_files": 0,
+          "planner_calls_median": 166,
+          "probe_requests_median": 166,
+          "probe_failures_median": 1,
+          "invalid_decisions_median": 0,
+          "duplicate_decisions_median": 0,
+          "cache_source_counts": {
+            "none": 166
+          },
+          "skip_reason_counts": {
+            "skip_reason_unreported": 1
+          }
+        },
+        "default-warm": {
+          "scan_elapsed_ms": 236328.142,
+          "filesystem_elapsed_ms": 53.131,
+          "inventory_elapsed_ms": null,
+          "decision_median_ms": 2103.106,
+          "decision_p95_ms": 4787.989,
+          "decision_count_median": 63,
+          "directories_walked": 1,
+          "files_walked": 166,
+          "media_files": 63,
+          "subtitle_files": 0,
+          "planner_calls_median": 166,
+          "probe_requests_median": 166,
+          "probe_failures_median": 1,
+          "invalid_decisions_median": 0,
+          "duplicate_decisions_median": 0,
+          "cache_source_counts": {
+            "none": 166
+          },
+          "skip_reason_counts": {
+            "skip_reason_unreported": 1
+          }
+        },
+        "smart-cold": {
+          "scan_elapsed_ms": 62848.809,
+          "filesystem_elapsed_ms": 23.634,
+          "inventory_elapsed_ms": 147.55,
+          "decision_median_ms": 2677.16,
+          "decision_p95_ms": 5313.916,
+          "decision_count_median": 62,
+          "directories_walked": 1,
+          "files_walked": 166,
+          "media_files": 62,
+          "subtitle_files": 50,
+          "planner_calls_median": 62,
+          "probe_requests_median": 62,
+          "probe_failures_median": 0,
+          "invalid_decisions_median": 0,
+          "duplicate_decisions_median": 0,
+          "cache_source_counts": {
+            "miss": 62
+          },
+          "skip_reason_counts": {
+            "other_skip_reason": 1
+          }
+        },
+        "smart-warm": {
+          "scan_elapsed_ms": 2014.152,
+          "filesystem_elapsed_ms": 0.214,
+          "inventory_elapsed_ms": 51.98,
+          "decision_median_ms": 24.123,
+          "decision_p95_ms": 54.893,
+          "decision_count_median": 62,
+          "directories_walked": 1,
+          "files_walked": 166,
+          "media_files": 62,
+          "subtitle_files": 50,
+          "planner_calls_median": 0,
+          "probe_requests_median": 0,
+          "probe_failures_median": 0,
+          "invalid_decisions_median": 0,
+          "duplicate_decisions_median": 0,
+          "cache_source_counts": {
+            "sqlite": 62
+          },
+          "skip_reason_counts": {
+            "other_skip_reason": 1
+          }
+        }
+      },
+      "case_validation": {
+        "default-warm": {
+          "eligibility_and_walk_parity_vs_default_cold": true,
+          "relative_to_default_cold": 0.406
+        },
+        "smart-cold": {
+          "eligibility_and_walk_parity_vs_default_cold": false,
+          "relative_to_default_cold": null
+        },
+        "smart-warm": {
+          "eligibility_and_walk_parity_vs_default_cold": false,
+          "relative_to_default_cold": null
+        }
+      },
+      "parity_counts": [
+        {
+          "default-warm": {
+            "missing_media_count": 0,
+            "extra_media_count": 0,
+            "changed_decision_count": 0,
+            "errors": [],
+            "matches": true
+          },
+          "smart-cold": {
+            "missing_media_count": 1,
+            "extra_media_count": 0,
+            "changed_decision_count": 0,
+            "errors": [],
+            "matches": false
+          },
+          "smart-warm": {
+            "missing_media_count": 1,
+            "extra_media_count": 0,
+            "changed_decision_count": 0,
+            "errors": [],
+            "matches": false
+          }
+        }
+      ]
+    },
+    {
+      "label": "dataset_2",
+      "status": "incomplete",
+      "completed_case": "default-cold",
+      "files_walked": 794,
+      "scan_elapsed_ms": 516115.924,
+      "interrupted_case": "default-warm",
+      "interruption_reason": "probe_stalled"
+    },
+    {
+      "label": "dataset_3",
+      "status": "not_run"
+    }
+  ]
+}
