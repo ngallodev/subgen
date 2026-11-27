@@ -8,8 +8,6 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
 import pytest
 
-# conftest.py has already patched sys.modules; safe to import subgen now
-import subgen
 from subgen import DeduplicatedQueue
 
 
@@ -38,11 +36,6 @@ class TestPut:
         q.put(_task("/a/b.mkv"))
         q.get()  # moves to _processing
         assert q.put(_task("/a/b.mkv")) is False
-
-    def test_force_bypasses_dedup(self, q):
-        task = _task("/a/b.mkv")
-        assert q.put(task) is True
-        assert q.put(task, force=True) is True
 
 
 class TestPriority:
@@ -134,36 +127,3 @@ class TestConcurrency:
         assert sum(successes) == 1, "Exactly one put should succeed for the same path"
 
 
-class TestForceQueueing:
-    def test_force_enqueue_bypasses_skip_logic(self, monkeypatch):
-        video = r"C:\media\movie.mkv"
-        monkeypatch.setattr(subgen, "has_audio", lambda path: True)
-        monkeypatch.setattr(subgen, "choose_transcribe_language", lambda *args, **kwargs: subgen.LanguageCode.ENGLISH)
-        monkeypatch.setattr(subgen, "should_whisper_detect_audio_language", False)
-
-        def fail_if_called(*args, **kwargs):
-            raise AssertionError("describe_skip_reason should not run during force enqueue")
-
-        monkeypatch.setattr(subgen, "describe_skip_reason", fail_if_called)
-
-        put_calls = []
-
-        def fake_put_with_result(item, block=True, timeout=None, force=False):
-            put_calls.append(force)
-            return {"queued": True, "status": "queued", "job_id": "test-job"}
-
-        monkeypatch.setattr(subgen.task_queue, "put_with_result", fake_put_with_result)
-
-        result = subgen.enqueue_media_job(
-            video,
-            "transcribe",
-            force=True,
-            audio_tracks=[{"language": subgen.LanguageCode.ENGLISH, "default": True}],
-        )
-
-        assert result["status"] == "queued"
-        assert put_calls == [True]
-
-    def test_force_helper_rejects_missing_path(self):
-        result = subgen.queue_single_forced_file("")
-        assert result["status"] == "error"

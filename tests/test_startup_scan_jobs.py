@@ -18,19 +18,19 @@ def _task(path):
     }
 
 
-def test_durable_jobs_deduplicate_force_and_retry(tmp_path):
+def test_durable_jobs_deduplicate_and_retry(tmp_path):
     source = tmp_path / "movie.mkv"
     source.write_bytes(b"video")
     store = DurableJobStore(str(tmp_path / "jobs.sqlite"))
     try:
         task = _task(source)
         first = store.admit(task)
-        duplicate = store.admit(task, force=True)
+        duplicate = store.admit(task)
 
         assert first.accepted is True
         assert duplicate.accepted is False
         assert duplicate.job_id == first.job_id
-        assert duplicate.status == "promoted"
+        assert duplicate.status == "already_active"
 
         claimed = store.claim(first.job_id)
         assert claimed is not None
@@ -58,7 +58,7 @@ def test_durable_jobs_allow_new_request_after_success(tmp_path):
         claimed = store.claim(first.job_id)
         store.finish(claimed, success=True)
 
-        second = store.admit(_task(source), force=True)
+        second = store.admit(_task(source))
         assert second.accepted is True
         assert second.job_id != first.job_id
     finally:
@@ -72,12 +72,12 @@ def test_durable_language_detection_survives_restart_in_same_job(tmp_path):
     task = dict(_task(source), type="detect_language", transcribe_or_translate="translate")
     store = DurableJobStore(db)
     try:
-        admitted = store.admit(task, force=True)
+        admitted = store.admit(task)
         claimed = store.claim(admitted.job_id)
         detected = {"type": "transcribe", "force_language": "jpn"}
         assert not store.complete_detection(dict(claimed, _claim_token="stale"), detected)
         assert store.complete_detection(claimed, detected)
-        assert store.admit(task, force=True).job_id == admitted.job_id
+        assert store.admit(task).job_id == admitted.job_id
         store.connection.execute("UPDATE subtitle_jobs SET lease_until=0 WHERE job_id=?", (admitted.job_id,))
     finally:
         store.close()
@@ -91,7 +91,7 @@ def test_durable_language_detection_survives_restart_in_same_job(tmp_path):
         assert resumed["transcribe_or_translate"] == "translate"
         assert resumed["force_language"] == "jpn"
         assert resumed["policy_signature"] == "policy-v1"
-        assert resumed["force"] is True
+        assert resumed["force"] is False
     finally:
         recovered.close()
 
@@ -106,7 +106,7 @@ def test_worker_transcribes_under_the_detected_jobs_claim(tmp_path, monkeypatch)
     work = subgen.DeduplicatedQueue()
     try:
         task = dict(_task(source), type="detect_language")
-        admitted = work.put_with_result(task, force=True)
+        admitted = work.put_with_result(task)
         stages = []
 
         def detect(path, *, original_task_data):
@@ -116,7 +116,7 @@ def test_worker_transcribes_under_the_detected_jobs_claim(tmp_path, monkeypatch)
         def transcribe(path, operation, language, *, audio_tracks, job_context):
             stages.append(("transcribe", job_context["_job_id"], job_context["_claim_token"]))
             assert language.to_iso_639_1() == "ja"
-            assert job_context["force"] is True
+            assert job_context["force"] is False
             return {"output_path": str(source.with_suffix(".srt"))}
 
         class EndWorker(Exception):
@@ -160,8 +160,8 @@ def test_worker_retries_a_transient_source_stat_error(tmp_path, monkeypatch):
     monkeypatch.setattr(subgen, "startup_scan_db_path", str(tmp_path / "scan.sqlite"))
     work = subgen.DeduplicatedQueue()
     try:
-        task = dict(_task(source), force=True)
-        admitted = work.put_with_result(task, force=True)
+        task = _task(source)
+        admitted = work.put_with_result(task)
         original_stat = subgen.os.stat
 
         def transient_stat_error(path, *args, **kwargs):
