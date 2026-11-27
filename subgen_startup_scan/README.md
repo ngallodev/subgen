@@ -723,9 +723,9 @@ If you need to understand or debug this system quickly, read in this order:
 - [startup_scan_next_improvements_plan.md](/C:/Users/Nathan/source/subgen/startup_scan_next_improvements_plan.md)
 ## Worker-free startup comparison
 
-The harness runs an upstream checkout pinned to a SHA, smart-cold, and smart-warm scans in separate Python processes. It records traversal and per-file decision timings, database seed counts, dataset and policy fingerprints, repeated-run medians, p95 per-file latency, and speed ratios. The warm database is seeded in an untimed worker-free process and copied before each measured warm run. Transcription workers are intercepted; the harness fails if any transcription worker starts or invokes generation.
+The harness runs four cases on the same dataset in separate Python processes: default cold and warm use the legacy backend; smart cold and warm use the persistent backend. The smart cold run seeds the inventory database copied into the warm run; the job journal is kept empty so warm evaluation does not short-circuit as already active. Transcription workers are intercepted, and the harness fails if generation starts.
 
-Each scan buffers decision events and writes JSONL after the timer stops. The report tracks non-media entries separately and compares the media IDs and eligibility decisions in every repetition. A changed dataset, scan error, duplicate decision, or unresolved probe leaves the affected speed ratio unset.
+The report contains aggregate timings, directory and file counts, per-file decision medians and p95s, and categorized skip-reason counts. It verifies directory counts and eligibility decisions across cases. A changed dataset, scan error, duplicate decision, or unresolved probe leaves relative timings unset. Per-file identifiers, paths, logs, and database state are discarded after parity checks; the saved report contains aggregate timings and counts only.
 
 `filesystem_elapsed_ms` measures directory-entry enumeration time (`os.scandir`) and is separate from `inventory_elapsed_ms`, which includes the persistent backend's complete inventory work such as file stats and record construction. `iterator_traversal_ms` measures time spent advancing the legacy `os.walk` iterator; it overlaps directory enumeration and should not be added to it. Per-file decision timings exclude transcription and translation.
 
@@ -734,11 +734,8 @@ Mount or protect the media dataset read-only, put the output directory outside i
 ```powershell
 rtk python tools/startup_scan_benchmark.py `
   --root "/homevideo/movies" `
-  --upstream-checkout "C:\source\subgen-upstream" `
-  --upstream-sha "<pinned-commit>" `
   --output-dir "C:\benchmarks\subgen-startup" `
-  --repetitions 3 `
-  --filesystem-cache-note "warm OS cache" `
+  --repetitions 1 `
   --dataset-read-only
 ```
 

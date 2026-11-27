@@ -68,7 +68,7 @@ def transcribe_existing(root):
     assert result["walk_files_seen"] == 3
     assert result["outcomes"] == {"queued": 1, "skip": 1}
     assert result["worker_starts"] == 0
-    assert result["summary"]["folders"] == [{"root_id": benchmark._path_id(str(media_root)), "files_found": 3}]
+    assert result["summary"]["files_found"] == 3
 
 
 def _case(*decisions, **case_fields):
@@ -93,9 +93,9 @@ def test_parity_checks_media_membership_and_eligibility():
     smart = _case(("a", "skip", ""), ("d", "queued", ""))
     mismatch = benchmark._compare_decisions(baseline, smart)
     assert mismatch["matches"] is False
-    assert mismatch["changed_decision_examples"] == ["a"]
-    assert mismatch["missing_media_examples"] == ["b"]
-    assert mismatch["extra_media_examples"] == ["d"]
+    assert mismatch["changed_decision_count"] == 1
+    assert mismatch["missing_media_count"] == 1
+    assert mismatch["extra_media_count"] == 1
 
 
 def test_parity_rejects_duplicate_decisions_and_probe_failures():
@@ -108,11 +108,10 @@ def test_parity_rejects_duplicate_decisions_and_probe_failures():
     assert mismatch["errors"] == ["duplicate_media_decisions", "invalid_media_decisions"]
 
 
-def test_later_repetition_can_withhold_speedup(tmp_path, monkeypatch):
+def test_later_repetition_can_withhold_relative_timing(tmp_path, monkeypatch):
     media_root = tmp_path / "media"
     media_root.mkdir()
     output = tmp_path / "report"
-    monkeypatch.setattr(benchmark, "_git_sha", lambda repo: "pinned")
     monkeypatch.setattr(benchmark, "_copy_sqlite", lambda src, dst: None)
     monkeypatch.setattr(
         benchmark.sys,
@@ -121,8 +120,6 @@ def test_later_repetition_can_withhold_speedup(tmp_path, monkeypatch):
             str(Path(benchmark.__file__)),
             "--root", str(media_root),
             "--output-dir", str(output),
-            "--upstream-checkout", str(tmp_path),
-            "--upstream-sha", "pinned",
             "--repetitions", "2",
             "--dataset-read-only",
         ],
@@ -138,7 +135,20 @@ def test_later_repetition_can_withhold_speedup(tmp_path, monkeypatch):
     assert benchmark.main() == 0
     report = json.loads((output / "startup-scan-comparison.json").read_text(encoding="utf-8"))
 
-    assert report["decision_parity"][0]["smart-cold"]["matches"] is True
-    assert report["decision_parity"][1]["smart-cold"]["matches"] is False
-    assert report["case_medians"]["smart-cold"]["speedup_vs_upstream"] is None
-    assert report["case_medians"]["smart-warm"]["speedup_vs_upstream"] == 1.0
+    assert report["parity_counts"][0]["smart-cold"]["matches"] is True
+    assert report["parity_counts"][1]["smart-cold"]["matches"] is False
+    assert report["case_validation"]["smart-cold"]["relative_to_default_cold"] is None
+    assert report["case_validation"]["smart-warm"]["relative_to_default_cold"] == 1.0
+    assert all("decision_outcomes" not in row for row in report["cases"])
+    assert list(output.iterdir()) == [output / "startup-scan-comparison.json"]
+
+
+def test_skipped_decisions_keep_only_reason_categories():
+    metrics = benchmark._decision_metrics(
+        [
+            {"event": "startup_scan.benchmark_decision", "file_id": "a", "outcome": "skip", "reason": "A .subgen_skip marker covers path", "evaluation_ms": 1.0},
+            {"event": "startup_scan.benchmark_decision", "file_id": "b", "outcome": "skip", "reason": "Subtitles already exist beside media", "evaluation_ms": 1.0},
+        ]
+    )
+
+    assert metrics["skip_reason_counts"] == {"skip_marker": 1, "subtitle_already_present": 1}
