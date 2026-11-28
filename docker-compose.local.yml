@@ -32,6 +32,7 @@ services:
          USE_MODEL_PROMPT: "False"
          MONITOR: "True"
          NAMESUBLANG: aa
+         STARTUP_SCAN_BACKEND: persistent
          STARTUP_SCAN_DB_PATH: "/subgen/state/subgen_scan.db"
          STARTUP_SCAN_BENCHMARK_LOGGING: "False"
          STARTUP_SCAN_BENCHMARK_LOG_PATH: "/subgen/state/startup_scan_benchmarks.jsonl"
