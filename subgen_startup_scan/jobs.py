@@ -11,6 +11,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import shutil
 import sqlite3
 import stat
 import time
@@ -81,6 +82,7 @@ def _as_plain_task(task: dict[str, Any]) -> dict[str, Any]:
         "audio_tracks": tracks,
         "mtime": int(task.get("mtime", 0) or 0),
         "force": bool(task.get("force", False)),
+        "allow_unsupported_extension": task.get("allow_unsupported_extension") is True,
         "policy_signature": str(task.get("policy_signature") or ""),
     }
 
@@ -272,7 +274,7 @@ class DurableJobStore:
             raise
 
     @_serialized
-    def claim(self, job_id: str | None = None) -> dict[str, Any] | None:
+    def claim(self, job_id: str | None = None, *, exclude_paths: list[str] | None = None) -> dict[str, Any] | None:
         now = time.time()
         conn = self.connection
         conn.execute("BEGIN IMMEDIATE")
@@ -284,9 +286,16 @@ class DurableJobStore:
                     (job_id, now),
                 ).fetchone()
             else:
+                excluded = {_canonical_path(path) for path in exclude_paths or []}
+                blocked_clause = ""
+                parameters: tuple[Any, ...] = (now,)
+                if excluded:
+                    blocked_clause = f"AND canonical_path NOT IN ({','.join('?' for _ in excluded)})"
+                    parameters += tuple(excluded)
                 row = conn.execute(
-                    "SELECT * FROM subtitle_jobs WHERE status IN ('pending','retry_due') AND next_retry_at<=? ORDER BY priority, created_at LIMIT 1",
-                    (now,),
+                    "SELECT * FROM subtitle_jobs WHERE status IN ('pending','retry_due') AND next_retry_at<=? "
+                    f"{blocked_clause} ORDER BY priority, created_at LIMIT 1",
+                    parameters,
                 ).fetchone()
             if not row:
                 conn.execute("COMMIT")
@@ -413,8 +422,12 @@ class DurableJobStore:
             os.replace(temp_path, output_path)
             return True
         canonical_output = _canonical_path(output_path)
+        backup_path = f"{output_path}.subgen-backup-{job_id}"
+        had_previous_output = os.path.isfile(output_path)
         conn = self.connection
         now = time.time()
+        backup_ready = False
+        output_replaced = False
         conn.execute("BEGIN IMMEDIATE")
         try:
             claim = conn.execute(
@@ -431,7 +444,13 @@ class DurableJobStore:
             if _sha256_file(temp_path) != sha256:
                 conn.execute("ROLLBACK")
                 return False
+            if had_previous_output:
+                shutil.copy2(output_path, backup_path)
+                backup_ready = _sha256_file(backup_path) == _sha256_file(output_path)
+                if not backup_ready:
+                    raise RuntimeError(f"Could not verify subtitle backup before publication: {output_path}")
             os.replace(temp_path, output_path)
+            output_replaced = True
             # Verify the file at its final path before recording the job as
             # successful. The caller also verifies after publication, but the
             # durable success state must never precede this check.
@@ -447,9 +466,20 @@ class DurableJobStore:
             )
             conn.execute("DELETE FROM subtitle_output_reservations WHERE job_id=?", (job_id,))
             conn.execute("COMMIT")
+            if had_previous_output:
+                try:
+                    os.unlink(backup_path)
+                except OSError:
+                    pass
             return True
         except Exception:
             conn.execute("ROLLBACK")
+            if output_replaced and had_previous_output and backup_ready:
+                os.replace(backup_path, output_path)
+            elif output_replaced and not had_previous_output and os.path.exists(output_path):
+                os.unlink(output_path)
+            elif os.path.exists(backup_path):
+                os.unlink(backup_path)
             raise
 
     @_serialized

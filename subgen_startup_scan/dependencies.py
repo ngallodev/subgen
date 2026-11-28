@@ -10,6 +10,7 @@ class StartupScanDependencies:
     legacy_startup_scan_existing: Callable[[str], None] | None = None
     task_queue: Any = None
     language_code: Any = None
+    is_supported_media_file: Callable[[str], bool] | None = None
     has_audio: Callable[[str], bool] | None = None
     get_audio_tracks: Callable[[str], list[dict[str, Any]]] | None = None
     choose_transcribe_language: Callable[..., Any] | None = None

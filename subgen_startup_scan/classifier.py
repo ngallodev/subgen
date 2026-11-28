@@ -35,6 +35,7 @@ def prepare_media_queue_job(
     audio_tracks=None,
     subtitle_rows=None,
     current_sidecar_state: str | None = None,
+    allow_unsupported_extension: bool = False,
     **task_kwargs,
 ):
     trace = _planner_trace(deps.startup_scan_planner_trace_logging)
@@ -43,14 +44,39 @@ def prepare_media_queue_job(
         for key, value in task_kwargs.items()
         if key not in {"path", "type", "transcribe_or_translate", "force_language", "audio_tracks", "force"}
     }
+    if allow_unsupported_extension:
+        metadata_kwargs["allow_unsupported_extension"] = True
 
     started_at = time.perf_counter()
-    if not force and deps.task_queue.is_active(file_path):
+    if deps.is_supported_media_file and not deps.is_supported_media_file(file_path) and not allow_unsupported_extension:
         if trace is not None:
             trace["active_check_ms"] = (time.perf_counter() - started_at) * 1000
         return {
-            "status": "active",
-            "reason": "already_queued",
+            "status": "skip",
+            "reason": "unsupported_media",
+            "details": "File extension is not a supported audio or video format.",
+            "planner_trace": trace,
+        }
+
+    queue_status = None
+    status_checker = getattr(deps.task_queue, "get_path_status", None)
+    if status_checker:
+        allow_pending_durable_promotion = bool(
+            force and getattr(deps.task_queue, "supports_durable_jobs", False)
+        )
+        queue_status = status_checker(
+            file_path,
+            include_queued=not allow_pending_durable_promotion,
+        )
+    elif not force and deps.task_queue.is_active(file_path):
+        queue_status = "already_active"
+
+    if queue_status:
+        if trace is not None:
+            trace["active_check_ms"] = (time.perf_counter() - started_at) * 1000
+        return {
+            "status": queue_status,
+            "reason": queue_status,
             "details": "File is already queued or processing.",
             "planner_trace": trace,
         }
@@ -83,19 +109,12 @@ def prepare_media_queue_job(
         try:
             audio_tracks = deps.get_audio_tracks(file_path)
         except Exception as exc:
-            task = {
-                "path": file_path,
-                "type": transcription_type,
-                "transcribe_or_translate": transcription_type,
-                "force_language": force_language,
-                "audio_tracks": None,
-            }
-            task.update(metadata_kwargs)
+            probe_reason = getattr(exc, "kind", "media_probe_error")
+            logging.warning("Media probe failed (%s) for %s: %s", probe_reason, os.path.basename(file_path), exc)
             return {
-                "status": "retryable_error",
-                "reason": "media_probe_failed",
+                "status": "probe_error",
+                "reason": probe_reason,
                 "details": str(exc),
-                "task": task,
                 "force_language": force_language,
                 "audio_tracks": [],
                 "audio_langs": [],
@@ -227,7 +246,35 @@ def prepare_media_queue_job(
     }
 
 
+def _validated_cached_audio_tracks(deps: StartupScanDependencies, cached_row: dict | None):
+    if not cached_row or cached_row.get("decision") != "eligible":
+        return None
+    try:
+        tracks = deps.deserialize_audio_tracks(
+            cached_row.get("audio_tracks_json"),
+            language_code=deps.language_code,
+        )
+    except Exception:
+        return None
+    if not isinstance(tracks, list) or not tracks or not all(
+        isinstance(track, dict)
+        and isinstance(track.get("index"), int)
+        and isinstance(track.get("codec"), str)
+        and bool(track.get("codec"))
+        and "language" in track
+        and isinstance(track.get("default"), bool)
+        for track in tracks
+    ):
+        return None
+    return tracks
+
+
 def queue_cached_job(deps: StartupScanDependencies, queue_path: str, cached_row: dict) -> bool:
+    cached_audio_tracks = _validated_cached_audio_tracks(deps, cached_row)
+    if cached_audio_tracks is None:
+        return False
+    if deps.is_supported_media_file and not deps.is_supported_media_file(queue_path):
+        return False
     if deps.task_queue.is_active(queue_path):
         return False
 
@@ -243,10 +290,7 @@ def queue_cached_job(deps: StartupScanDependencies, queue_path: str, cached_row:
             "policy_signature": cached_row.get("policy_signature") or "",
         }
     else:
-        audio_tracks = deps.deserialize_audio_tracks(
-            cached_row.get("audio_tracks_json"),
-            language_code=deps.language_code,
-        )
+        audio_tracks = cached_audio_tracks
         force_language_code = cached_row.get("force_language_code") or ""
         force_language = (
             deps.language_code.from_string(force_language_code)
@@ -263,8 +307,7 @@ def queue_cached_job(deps: StartupScanDependencies, queue_path: str, cached_row:
             "policy_signature": cached_row.get("policy_signature") or "",
         }
 
-    deps.task_queue.put(task)
-    return True
+    return bool(deps.task_queue.put(task))
 
 
 def plan_media_record(
@@ -279,10 +322,7 @@ def plan_media_record(
     plan_started_at = time.perf_counter()
     cached_audio_tracks = None
     if cached_row and cached_row.get("has_audio") and _matches_media_fingerprint(media, cached_row):
-        cached_audio_tracks = deps.deserialize_audio_tracks(
-            cached_row.get("audio_tracks_json"),
-            language_code=deps.language_code,
-        ) or None
+        cached_audio_tracks = _validated_cached_audio_tracks(deps, cached_row)
     plan = prepare_media_queue_job(
         deps,
         queue_path,
@@ -296,7 +336,7 @@ def plan_media_record(
     )
     plan_ms = (time.perf_counter() - plan_started_at) * 1000
 
-    if plan["status"] in {"skip", "active"}:
+    if plan["status"] in {"skip", "active", "already_active", "busy", "probe_error", "retryable_error"}:
         signature_ms = 0.0
         subtitle_signature = ""
         matching_subtitles = subtitle_rows or []
@@ -438,6 +478,7 @@ def classify_media(
         "ignored": 0,
         "cache_hit": 0,
         "cache_miss": 0,
+        "probe_errors": 0,
     }
     benchmark_decision_samples: list[float] = []
     benchmark_outcomes: dict[str, int] = {}
@@ -553,7 +594,7 @@ def classify_media(
                         cached_row.get("decision") == "eligible"
                         and cached_row.get("reason") != "completed"
                         and sidecar_matches
-                        and cached_row.get("audio_tracks_json")
+                        and _validated_cached_audio_tracks(deps, cached_row) is not None
                     ):
                         decision_started_at = time.perf_counter()
                         if queue_cached_job(deps, queue_path, cached_row):
@@ -699,7 +740,24 @@ def classify_media(
                     plan.get("reason", "unspecified"),
                 )
 
-                reusable_cached_record = _matches_cached_record(media, cached_row, policy_signature)
+                # A current probe failure must never replay a stale cached
+                # eligible/excluded decision or be persisted as a new decision.
+                if plan.get("status") in {"probe_error", "retryable_error"}:
+                    totals["cache_miss"] += 1
+                    totals["probe_errors"] += 1
+                    final_outcomes_by_path[queue_path] = plan.get("reason", "media_probe_error")
+                    continue
+
+                reusable_cached_record = bool(
+                    cached_row
+                    and cached_row.get("decision") in {"eligible", "excluded"}
+                    and plan.get("reason") != "unsupported_media"
+                    and _matches_cached_record(media, cached_row, policy_signature)
+                    and (
+                        cached_row.get("decision") != "eligible"
+                        or _validated_cached_audio_tracks(deps, cached_row) is not None
+                    )
+                )
                 if reusable_cached_record and cached_row.get("decision") == "excluded":
                     reusable_cached_record = bool(
                         plan.get("status") == "skip"
@@ -872,13 +930,13 @@ def classify_media(
                     apply_stats["db_upsert_media_ms"] += (time.perf_counter() - db_started_at) * 1000
                     continue
 
-                if plan["status"] == "active":
+                if plan["status"] in {"active", "already_active", "busy"}:
                     apply_stats["miss_active_count"] += 1
                     totals["ignored"] += 1
-                    final_outcomes_by_path[queue_path] = "already_active"
+                    final_outcomes_by_path[queue_path] = plan["status"]
                     continue
 
-                if plan["status"] in {"queue", "detect", "retryable_error"}:
+                if plan["status"] in {"queue", "detect"}:
                     apply_stats["miss_queue_count"] += 1
                     json_started_at = time.perf_counter()
                     task = plan["task"]
@@ -902,7 +960,6 @@ def classify_media(
                     apply_stats["queue_request_count"] += 1
                     apply_stats["queue_request_ms"] += (time.perf_counter() - queue_started_at) * 1000
                     db_started_at = time.perf_counter()
-                    probe_succeeded = plan["status"] != "retryable_error"
                     db.upsert_media(
                         path=queue_path,
                         source_path=media["path"],
@@ -912,17 +969,17 @@ def classify_media(
                         device=media.get("device"),
                         inode=media.get("inode"),
                         subtitle_signature=subtitle_signature,
-                        has_audio=bool(plan.get("audio_tracks")) if probe_succeeded else None,
-                        audio_language=(task.get("force_language").to_iso_639_2_t() if task.get("force_language") else "") if probe_succeeded else None,
+                        has_audio=bool(plan.get("audio_tracks")),
+                        audio_language=task.get("force_language").to_iso_639_2_t() if task.get("force_language") else "",
                         subtitle_state="external" if matching_subtitles else "unknown",
-                        decision="eligible" if probe_succeeded else "retryable_error",
+                        decision="eligible",
                         reason=plan["reason"],
                         policy_signature=policy_signature,
                         task_type=task.get("type") or task.get("transcribe_or_translate") or deps.transcribe_or_translate,
                         transcription_type=task.get("transcribe_or_translate") or deps.transcribe_or_translate,
                         force_language_code=task.get("force_language").to_iso_639_2_t() if task.get("force_language") else "",
-                        audio_tracks_json=audio_tracks_json if probe_succeeded else None,
-                        audio_langs_json=audio_langs_json if probe_succeeded else None,
+                        audio_tracks_json=audio_tracks_json,
+                        audio_langs_json=audio_langs_json,
                     )
                     apply_stats["db_upsert_media_count"] += 1
                     apply_stats["db_upsert_media_ms"] += (time.perf_counter() - db_started_at) * 1000

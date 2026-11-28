@@ -46,6 +46,7 @@ import ast
 import asyncio
 import ctypes
 import ctypes.util
+import errno
 import gc
 import hashlib
 import json
@@ -420,17 +421,95 @@ class SupersededJobError(RuntimeError):
     """A durable request no longer matches its admitted source or policy."""
 
 
+class MediaProbeError(RuntimeError):
+    """A media probe failed; the failure is not safe to turn into a queue job."""
+
+    def __init__(self, file_path: str, kind: str, message: str):
+        super().__init__(message)
+        self.file_path = file_path
+        self.kind = kind
+
+
+def _media_probe_failure_kind(error):
+    transient_errnos = {
+        getattr(errno, name)
+        for name in (
+            "EAGAIN", "EIO", "ETIMEDOUT", "ECONNRESET", "ECONNABORTED",
+            "ENETDOWN", "ENETUNREACH", "EHOSTDOWN", "EHOSTUNREACH", "ESTALE",
+        )
+        if hasattr(errno, name)
+    }
+    cause = error
+    details = []
+    while cause is not None:
+        if getattr(cause, "errno", None) in transient_errnos:
+            return "media_probe_transient"
+        stderr = getattr(cause, "stderr", None)
+        if stderr:
+            details.append(stderr.decode("utf-8", errors="replace") if isinstance(stderr, bytes) else str(stderr))
+        details.append(str(cause))
+        cause = getattr(cause, "__cause__", None)
+    message = " ".join(details).lower()
+    if any(token in message for token in (
+        "input/output error",
+        "resource temporarily unavailable",
+        "stale file handle",
+        "connection timed out",
+        "transport endpoint is not connected",
+        "network is unreachable",
+        "host is down",
+        "connection reset by peer",
+    )):
+        return "media_probe_transient"
+    if any(token in message for token in (
+        "invalid data found",
+        "moov atom not found",
+        "does not contain any stream",
+        "syntax error near offset",
+    )):
+        return "media_probe_invalid"
+    if "permission denied" in message or "operation not permitted" in message:
+        return "media_probe_access_denied"
+    return "media_probe_error"
+
+
 class DeduplicatedQueue(queue.PriorityQueue):
     """Queue that prevents duplicates, handles priority, and tracks status."""
     def __init__(self):
         super().__init__()
         self._queued = set()     # Tracks task IDs waiting in queue
         self._processing = set() # Tracks task IDs currently being handled
+        self._volatile = set()   # Active reservations owned only by this process
         self._counter = 0
         self._lock = Lock()
         self._durable = None
         if get_startup_scan_backend_name(default="legacy") == "persistent":
             self._durable = DurableJobStore(startup_scan_db_path + ".jobs")
+
+    @property
+    def supports_durable_jobs(self):
+        return self._durable is not None
+
+    @staticmethod
+    def _task_key(item):
+        path = item["path"]
+        if item.get("type") == "asr" and not item.get("video_file"):
+            # ASR upload IDs are opaque hashes; a file-backed ASR path still
+            # participates in the same reservation as ordinary media jobs.
+            if isinstance(path, str) and path.startswith("asr-") and not os.path.splitext(path)[1] and "/" not in path and "\\" not in path:
+                return path
+        if isinstance(path, str):
+            return os.path.normcase(os.path.abspath(os.path.expanduser(path)))
+        return path
+
+    def get_path_status(self, path, *, include_queued=True):
+        key = self._task_key({"path": path})
+        with self._lock:
+            if key in self._processing:
+                return "busy"
+            if include_queued and key in self._queued:
+                return "already_active"
+        return None
 
     def put(self, item, block=True, timeout=None, force=False):
         return self.put_with_result(item, block=block, timeout=timeout, force=force)["queued"]
@@ -438,6 +517,7 @@ class DeduplicatedQueue(queue.PriorityQueue):
     def put_with_result(self, item, block=True, timeout=None, force=False):
         with self._lock:
             task_id = item["path"]
+            task_key = self._task_key(item)
             durable_file_job = bool(
                 self._durable
                 and not item.get("audio_content")
@@ -445,12 +525,27 @@ class DeduplicatedQueue(queue.PriorityQueue):
                 and isinstance(task_id, str)
                 and os.path.isfile(task_id)
             )
+            if durable_file_job and task_key in self._volatile:
+                return {
+                    "queued": False,
+                    "status": "busy" if task_key in self._processing else "already_active",
+                    "job_id": None,
+                }
+            if durable_file_job and (task_key in self._queued or task_key in self._processing):
+                # A durable row must not be created behind an in-memory ASR or
+                # other non-journaled reservation for the same media path.
+                if not self._durable.is_active(task_id):
+                    return {
+                        "queued": False,
+                        "status": "busy" if task_key in self._processing else "already_active",
+                        "job_id": None,
+                    }
             if durable_file_job:
                 admission = self._durable.admit(item, force=force)
                 if not admission.accepted:
                     return {"queued": False, "status": admission.status, "job_id": admission.job_id}
                 item = {**item, "_job_id": admission.job_id}
-            if (force or (task_id not in self._queued and task_id not in self._processing)) and not (durable_file_job and task_id in self._queued):
+            if task_key not in self._queued and task_key not in self._processing:
                 # Priority: 0 (Detect), 1 (ASR), 2 (Transcribe)
                 task_type = item.get("type", "transcribe")
                 priority = 0 if task_type == "detect_language" else (1 if task_type == "asr" else 2)
@@ -459,9 +554,15 @@ class DeduplicatedQueue(queue.PriorityQueue):
                 # Newer files sort first within the same task type.
                 self._counter += 1
                 super().put((priority, -mtime, self._counter, item), block, timeout)
-                self._queued.add(task_id)
+                self._queued.add(task_key)
+                if not item.get("_job_id"):
+                    self._volatile.add(task_key)
                 return {"queued": True, "status": "queued", "job_id": item.get("_job_id")}
-            return {"queued": False, "status": "already_active", "job_id": None}
+            return {
+                "queued": False,
+                "status": "busy" if task_key in self._processing else "already_active",
+                "job_id": None,
+            }
 
     def get(self, block=True, timeout=None):
         deadline = None if timeout is None else time.monotonic() + timeout
@@ -474,7 +575,7 @@ class DeduplicatedQueue(queue.PriorityQueue):
                     if claimed is None:
                         super().task_done()
                         with self._lock:
-                            self._queued.discard(item["path"])
+                            self._queued.discard(self._task_key(item))
                         continue
                     item = claimed
                     item["force_language"] = LanguageCode.from_string(item.get("force_language") or "")
@@ -487,34 +588,57 @@ class DeduplicatedQueue(queue.PriorityQueue):
                     ]
             except queue.Empty:
                 if self._durable:
-                    item = self._durable.claim()
-                    if item is not None:
-                        item["force_language"] = LanguageCode.from_string(item.get("force_language") or "")
-                        item["audio_tracks"] = [
-                            {
-                                **track,
-                                "language": LanguageCode.from_string(track.get("language") or ""),
-                            }
-                            for track in item.get("audio_tracks") or []
-                        ]
-                        with self._lock:
-                            self._processing.add(item["path"])
-                        with self.mutex:
-                            self.unfinished_tasks += 1
-                        return item
+                    with self._lock:
+                        blocked_paths = list(self._queued | self._processing)
+                        item = self._durable.claim(exclude_paths=blocked_paths)
+                        if item is not None:
+                            item["force_language"] = LanguageCode.from_string(item.get("force_language") or "")
+                            item["audio_tracks"] = [
+                                {
+                                    **track,
+                                    "language": LanguageCode.from_string(track.get("language") or ""),
+                                }
+                                for track in item.get("audio_tracks") or []
+                            ]
+                            self._processing.add(self._task_key(item))
+                            with self.mutex:
+                                self.unfinished_tasks += 1
+                            return item
                 raise
             with self._lock:
-                task_id = item["path"]
-                self._queued.discard(task_id)
-                self._processing.add(task_id)
+                task_key = self._task_key(item)
+                self._queued.discard(task_key)
+                self._processing.add(task_key)
             return item
 
     def mark_done(self, item, success=False, error=None, outcome=None):
         with self._lock:
-            task_id = item["path"]
-            self._processing.discard(task_id)
+            task_key = self._task_key(item)
+            self._processing.discard(task_key)
+            self._volatile.discard(task_key)
         if self._durable and item.get("_job_id"):
             self._durable.finish(item, success=success, error=error, outcome=outcome)
+
+    def handoff(self, item, next_item):
+        """Atomically transfer a legacy task's active path claim to its successor."""
+        with self._lock:
+            old_key = self._task_key(item)
+            next_key = self._task_key(next_item)
+            if next_key in self._queued:
+                self._processing.discard(old_key)
+                self.task_done()
+                return False
+            task_type = next_item.get("type", "transcribe")
+            priority = 0 if task_type == "detect_language" else (1 if task_type == "asr" else 2)
+            mtime = next_item.get("mtime", 0) or 0
+            self._counter += 1
+            super().put((priority, -mtime, self._counter, next_item))
+            self._queued.add(next_key)
+            self._processing.discard(old_key)
+            # Add successor before finishing predecessor so Queue.join cannot
+            # observe a false zero-work gap during language detection.
+            self.task_done()
+            return True
 
     def renew_job(self, item):
         if self._durable and item.get("_job_id") and item.get("_claim_token"):
@@ -554,8 +678,12 @@ class DeduplicatedQueue(queue.PriorityQueue):
 
     def is_active(self, task_id):
         """Checks if a task_id is currently queued or processing."""
+        task_key = self._task_key({"path": task_id})
+        keys = {task_key, task_id} if isinstance(task_id, str) else {task_key}
         with self._lock:
-            return task_id in self._queued or task_id in self._processing or bool(self._durable and self._durable.is_active(task_id))
+            return any(key in self._queued or key in self._processing for key in keys) or bool(
+                self._durable and self._durable.is_active(task_id)
+            )
 
     def verified_completions(self, candidates, *, operation, policy_signature):
         """Get still-valid completed paths from the durable publication journal."""
@@ -840,7 +968,7 @@ def enqueue_media_job(
         audio_tracks=audio_tracks,
         **task_kwargs,
     )
-    if plan.get("status") in {"active", "skip"}:
+    if plan.get("status") in {"active", "busy", "already_active", "skip", "probe_error", "retryable_error"}:
         return plan
     task = plan.get("task")
     if task:
@@ -871,15 +999,18 @@ def queue_single_forced_file(
     if transcription_type not in {"transcribe", "translate"}:
         return {"status": "error", "message": "transcription_type must be transcribe or translate"}
 
+    if not isinstance(allow_invalid, bool):
+        return {"status": "error", "message": "allow_invalid must be a boolean"}
+
     mapped_path = path_mapping(file_path)
-    if not allow_invalid:
-        if not os.path.exists(mapped_path):
-            return {"status": "error", "message": f"File not found: {mapped_path}"}
-        if not os.path.isfile(mapped_path):
-            return {"status": "error", "message": f"Path is not a file: {mapped_path}"}
-        base_name = os.path.basename(mapped_path)
-        if not (has_video_extension(base_name) or has_audio_extension(base_name)):
-            return {"status": "error", "message": f"Unsupported media file: {mapped_path}"}
+    if not os.path.exists(mapped_path):
+        return {"status": "error", "message": f"File not found: {mapped_path}"}
+    if not os.path.isfile(mapped_path):
+        return {"status": "error", "message": f"Path is not a file: {mapped_path}"}
+    base_name = os.path.basename(mapped_path)
+    supported_extension = has_video_extension(base_name) or has_audio_extension(base_name)
+    if not supported_extension and not allow_invalid:
+        return {"status": "error", "message": f"Unsupported media file: {mapped_path}"}
 
     force_language_code = LanguageCode.from_string(force_language) if force_language else LanguageCode.NONE
     return enqueue_media_job(
@@ -887,7 +1018,8 @@ def queue_single_forced_file(
         transcription_type,
         force_language=force_language_code,
         force=True,
-        audio_tracks=audio_tracks,
+        audio_tracks=audio_tracks if supported_extension else None,
+        allow_unsupported_extension=bool(allow_invalid and not supported_extension),
     )
 
 
@@ -992,7 +1124,7 @@ def startup_scan_existing(transcribe_folder_spec: str):
 
 def _legacy_startup_scan_existing(transcribe_folder_spec: str, *, honor_skip_setting: bool = False) -> dict:
     folders = parse_roots(transcribe_folder_spec)
-    summary = {"files_found": 0, "queued": 0, "errors": 0, "folders": []}
+    summary = {"files_found": 0, "queued": 0, "unsupported_files": 0, "errors": 0, "folders": []}
     if skip_startup_scan and honor_skip_setting:
         logging.info("SKIP_STARTUP_SCAN is enabled - skipping existing file scan.")
     else:
@@ -1008,9 +1140,14 @@ def _legacy_startup_scan_existing(transcribe_folder_spec: str, *, honor_skip_set
             if os.path.isfile(path):
                 folder_queued_before = summary["queued"]
                 summary["files_found"] += 1
-                if gen_subtitles_queue(path_mapping(path), transcribe_or_translate, LanguageCode.NONE):
+                supported_path = path_mapping(path)
+                if not (has_video_extension(os.path.basename(supported_path)) or has_audio_extension(os.path.basename(supported_path))):
+                    summary["unsupported_files"] += 1
+                    summary["folders"].append({"path": path, "exists": True, "files_found": 1, "queued": 0, "unsupported_files": 1, "errors": 0, "status": "unsupported_media"})
+                    continue
+                if gen_subtitles_queue(supported_path, transcribe_or_translate, LanguageCode.NONE):
                     summary["queued"] += 1
-                summary["folders"].append({"path": path, "exists": True, "files_found": 1, "queued": summary["queued"] - folder_queued_before, "errors": 0})
+                summary["folders"].append({"path": path, "exists": True, "files_found": 1, "queued": summary["queued"] - folder_queued_before, "unsupported_files": 0, "errors": 0})
                 continue
             if not os.path.isdir(path):
                 summary["errors"] += 1
@@ -1023,6 +1160,7 @@ def _legacy_startup_scan_existing(transcribe_folder_spec: str, *, honor_skip_set
 
             files_before = summary["files_found"]
             queued_before = summary["queued"]
+            unsupported_before = summary["unsupported_files"]
             errors_before = summary["errors"]
             def _on_walk_error(exc):
                 summary["errors"] += 1
@@ -1036,19 +1174,25 @@ def _legacy_startup_scan_existing(transcribe_folder_spec: str, *, honor_skip_set
                 for file_name in files:
                     summary["files_found"] += 1
                     file_path = os.path.join(root, file_name)
-                    if gen_subtitles_queue(path_mapping(file_path), transcribe_or_translate, LanguageCode.NONE):
+                    mapped_path = path_mapping(file_path)
+                    if not (has_video_extension(os.path.basename(mapped_path)) or has_audio_extension(os.path.basename(mapped_path))):
+                        summary["unsupported_files"] += 1
+                        logging.debug("Skipping unsupported startup scan entry: %s", file_name)
+                        continue
+                    if gen_subtitles_queue(mapped_path, transcribe_or_translate, LanguageCode.NONE):
                         summary["queued"] += 1
             summary["folders"].append({
                 "path": path,
                 "exists": True,
                 "files_found": summary["files_found"] - files_before,
                 "queued": summary["queued"] - queued_before,
+                "unsupported_files": summary["unsupported_files"] - unsupported_before,
                 "errors": summary["errors"] - errors_before,
             })
 
         logging.info(
-            "Startup scan complete: %s files found, %s queued, %s errors.",
-            summary["files_found"], summary["queued"], summary["errors"],
+            "Startup scan complete: %s files found, %s queued, %s unsupported entries, %s errors.",
+            summary["files_found"], summary["queued"], summary["unsupported_files"], summary["errors"],
         )
 
     if not monitor:
@@ -1076,6 +1220,7 @@ def _build_startup_scan_dependencies(*, honor_skip_setting: bool = True) -> Star
         ),
         task_queue=task_queue,
         language_code=LanguageCode,
+        is_supported_media_file=lambda path: has_video_extension(os.path.basename(path)) or has_audio_extension(os.path.basename(path)),
         has_audio=has_audio,
         get_audio_tracks=get_audio_tracks,
         choose_transcribe_language=choose_transcribe_language,
@@ -1172,6 +1317,14 @@ def transcription_worker():
                     raise SupersededJobError("Subtitle policy changed after the job was admitted.")
             task_type = task.get("type", "transcribe")
             path = task.get("path", "unknown")
+            if (
+                task_type != "asr"
+                and not task.get("audio_content")
+                and isinstance(path, str)
+                and not task.get("allow_unsupported_extension")
+                and not (has_video_extension(os.path.basename(path)) or has_audio_extension(os.path.basename(path)))
+            ):
+                raise SupersededJobError("Queued task has an unsupported media extension.")
             display_name = os.path.basename(path) if ("/" in str(path) or "\\" in str(path)) else path
             
             # Status for START log
@@ -1249,15 +1402,14 @@ def transcription_worker():
                 lease_stop.set()
                 if lease_thread:
                     lease_thread.join(timeout=1)
-                task_queue.task_done()
-                task_queue.mark_done(task, success=job_success, error=job_error, outcome=job_outcome)
-
-                # The legacy queue releases the path before admitting the detected task.
                 if next_task:
-                    if task_queue.put(next_task):
+                    if task_queue.handoff(task, next_task):
                         logging.debug(f"Queued transcription for detected language: {next_task['path']}")
                     else:
                         logging.debug(f"Transcription already queued/processing for: {next_task['path']}")
+                else:
+                    task_queue.task_done()
+                    task_queue.mark_done(task, success=job_success, error=job_error, outcome=job_outcome)
                         
                 delete_model()
 
@@ -1557,7 +1709,7 @@ def force_enqueue(payload: dict = Body(...)):
         transcription_type=payload.get("transcription_type"),
         force_language=payload.get("force_language"),
         audio_tracks=payload.get("audio_tracks"),
-        allow_invalid=bool(payload.get("allow_invalid", False)),
+        allow_invalid=payload.get("allow_invalid", False),
     )
 
 # ============================================================================
@@ -1605,8 +1757,9 @@ async def asr(
         audio_hash = generate_audio_hash(file_content, task, language)
         
         # FIX: Use video file path if available to match TRANSCRIBE tasks
-        if video_file:
-            task_id = path_mapping(video_file)
+        mapped_video_file = path_mapping(video_file) if video_file else None
+        if mapped_video_file:
+            task_id = DeduplicatedQueue._task_key({"path": mapped_video_file})
             logging.debug(f"Using mapped video file path as task ID for ASR request: {task_id}")
         else:
             task_id = f"asr-{audio_hash}"
@@ -1630,7 +1783,7 @@ async def asr(
             'type': 'asr',
             'task': task,
             'language': final_language,
-            'video_file': video_file,
+            'video_file': mapped_video_file,
             'initial_prompt': initial_prompt,
             'audio_content': file_content,
             'encode': encode,
@@ -2532,16 +2685,18 @@ def gen_subtitles(
         ):
             raise RuntimeError(f"Published subtitle verification failed: {subtitle_file_path}")
         # FIX: Provide the generated subtitle result to any waiting ASR endpoint requests
+        result_key = DeduplicatedQueue._task_key({"path": file_path})
         with task_results_lock:
-            if file_path in task_results:
-                task_results[file_path].set_result(result.to_srt_vtt(filepath=None, word_level=word_level_highlight))
+            if result_key in task_results:
+                task_results[result_key].set_result(result.to_srt_vtt(filepath=None, word_level=word_level_highlight))
 
     except Exception as e:
         logging.error("Error processing or transcribing %s in %s: %s", file_path, force_language, e, exc_info=True)
         # FIX: Inform waiting ASR endpoint requests of the error so they don't hang
+        result_key = DeduplicatedQueue._task_key({"path": file_path})
         with task_results_lock:
-            if file_path in task_results:
-                task_results[file_path].set_error(str(e))
+            if result_key in task_results:
+                task_results[result_key].set_error(str(e))
         raise
 
     finally:
@@ -2744,7 +2899,12 @@ def _media_probe_signature(file_path: str):
     try:
         stat_result = os.stat(file_path)
     except OSError as exc:
-        raise FileNotFoundError(f"Media file is missing or unreadable during probing: {file_path}") from exc
+        kind = _media_probe_failure_kind(exc)
+        raise MediaProbeError(
+            file_path,
+            kind,
+            f"Could not stat media before probing ({kind}): {exc}",
+        ) from exc
 
     return (
         os.path.abspath(file_path),
@@ -2803,9 +2963,20 @@ def _probe_media_streams_cached(file_path: str, file_size: int, file_mtime_ns: i
                 subtitle_languages.append(language)
     except ffmpeg.Error as e:
         error_details = getattr(e, "stderr", None) or str(e)
-        raise RuntimeError(f"FFmpeg could not probe media streams for {file_path}: {error_details}") from e
+        error_text = error_details.decode("utf-8", errors="replace") if isinstance(error_details, bytes) else str(error_details)
+        kind = _media_probe_failure_kind(e)
+        raise MediaProbeError(
+            file_path,
+            kind,
+            f"FFmpeg could not probe media streams ({kind}): {error_text[-500:]}",
+        ) from e
     except Exception as e:
-        raise RuntimeError(f"Could not probe media stream metadata for {file_path}: {e}") from e
+        kind = _media_probe_failure_kind(e)
+        raise MediaProbeError(
+            file_path,
+            kind,
+            f"Could not probe media stream metadata ({kind}): {e}",
+        ) from e
 
     return {
         "audio_tracks": audio_tracks,
@@ -3487,12 +3658,15 @@ class NewFileHandler(FileSystemEventHandler):
     def create_subtitle(self, event):
         if not event.is_directory:
             file_path = event.src_path
+            if not (has_video_extension(os.path.basename(file_path)) or has_audio_extension(os.path.basename(file_path))):
+                logging.debug("Ignoring unsupported file-system event: %s", os.path.basename(file_path))
+                return
             if _is_in_skipped_dir(file_path):
                 logging.info(f"Skipping (skip marker present): {file_path}")
                 return
-            if has_audio(file_path):
-                logging.info(f"File: {path_mapping(file_path)} was added")
-                gen_subtitles_queue(path_mapping(file_path), transcribe_or_translate)
+            mapped_path = path_mapping(file_path)
+            logging.info("File: %s was added", os.path.basename(mapped_path))
+            gen_subtitles_queue(mapped_path, transcribe_or_translate)
 
     def handle_event(self, event):
         """Wait for file stability before processing."""

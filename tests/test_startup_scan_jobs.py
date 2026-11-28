@@ -2,6 +2,9 @@ from types import FunctionType, SimpleNamespace
 
 import pytest
 
+import hashlib
+
+import subgen_startup_scan.jobs as jobs_module
 from subgen_startup_scan.jobs import DurableJobStore
 
 
@@ -65,11 +68,26 @@ def test_durable_jobs_allow_new_request_after_success(tmp_path):
         store.close()
 
 
+def test_durable_job_preserves_validated_unusual_extension_override(tmp_path):
+    source = tmp_path / "movie.media"
+    source.write_bytes(b"video")
+    store = DurableJobStore(str(tmp_path / "jobs.sqlite"))
+    try:
+        task = dict(_task(source), force=True, allow_unsupported_extension=True)
+        admitted = store.admit(task, force=True)
+        claimed = store.claim(admitted.job_id)
+
+        assert admitted.accepted is True
+        assert claimed["allow_unsupported_extension"] is True
+    finally:
+        store.close()
+
+
 def test_durable_language_detection_survives_restart_in_same_job(tmp_path):
     source = tmp_path / "movie.mkv"
     source.write_bytes(b"video")
     db = str(tmp_path / "jobs.sqlite")
-    task = dict(_task(source), type="detect_language", transcribe_or_translate="translate")
+    task = dict(_task(source), type="detect_language", transcribe_or_translate="translate", allow_unsupported_extension=True)
     store = DurableJobStore(db)
     try:
         admitted = store.admit(task, force=True)
@@ -92,6 +110,7 @@ def test_durable_language_detection_survives_restart_in_same_job(tmp_path):
         assert resumed["force_language"] == "jpn"
         assert resumed["policy_signature"] == "policy-v1"
         assert resumed["force"] is True
+        assert resumed["allow_unsupported_extension"] is True
     finally:
         recovered.close()
 
@@ -195,3 +214,117 @@ def test_worker_retries_a_transient_source_stat_error(tmp_path, monkeypatch):
         assert row["active_key"]
     finally:
         work._durable.close()
+
+
+def test_durable_claim_skips_paths_reserved_by_memory_queue(tmp_path):
+    source = tmp_path / "movie.mkv"
+    source.write_bytes(b"video")
+    other = tmp_path / "other.mkv"
+    other.write_bytes(b"video")
+    store = DurableJobStore(str(tmp_path / "jobs.sqlite"))
+    try:
+        blocked = store.admit(_task(source), force=True)
+        available = store.admit(_task(other), force=True)
+
+        claimed = store.claim(exclude_paths=[str(source)])
+        assert claimed["path"] == str(other)
+        store.finish(claimed, success=True)
+        row = store.connection.execute(
+            "SELECT status FROM subtitle_jobs WHERE job_id=?", (blocked.job_id,)
+        ).fetchone()
+        assert row["status"] == "pending"
+    finally:
+        store.close()
+
+
+def test_durable_admission_does_not_persist_behind_memory_asr_reservation(tmp_path, monkeypatch):
+    import subgen
+
+    source = tmp_path / "movie.mkv"
+    source.write_bytes(b"video")
+    monkeypatch.setenv("STARTUP_SCAN_BACKEND", "persistent")
+    monkeypatch.setattr(subgen, "startup_scan_db_path", str(tmp_path / "scan.sqlite"))
+    work = subgen.DeduplicatedQueue()
+    try:
+        assert work.put({
+            "path": str(source),
+            "type": "asr",
+            "video_file": str(source),
+            "audio_content": b"audio",
+        })
+        restored = work._durable.admit(_task(source), force=True)
+        result = work.put_with_result(dict(_task(source), force=True), force=True)
+
+        assert result["status"] == "already_active"
+        assert work._durable.connection.execute(
+            "SELECT COUNT(*) FROM subtitle_jobs"
+        ).fetchone()[0] == 1
+        active = work.get()
+        with pytest.raises(subgen.queue.Empty):
+            work.get(timeout=0.01)
+        assert work._durable.connection.execute(
+            "SELECT status FROM subtitle_jobs WHERE job_id=?", (restored.job_id,)
+        ).fetchone()["status"] == "pending"
+        work.task_done()
+        work.mark_done(active, success=True)
+    finally:
+        work._durable.close()
+
+
+def test_failed_durable_publication_restores_previous_subtitle(tmp_path, monkeypatch):
+    source = tmp_path / "movie.mkv"
+    source.write_bytes(b"video")
+    output = tmp_path / "movie.eng.srt"
+    output.write_bytes(b"previous valid subtitle")
+    temp = tmp_path / "movie.eng.srt.tmp"
+    temp.write_bytes(b"new subtitle")
+    store = DurableJobStore(str(tmp_path / "jobs.sqlite"))
+    try:
+        admitted = store.admit(dict(_task(source), force=True), force=True)
+        claimed = store.claim(admitted.job_id)
+        digest = hashlib.sha256(temp.read_bytes()).hexdigest()
+        assert store.set_publish_intent(claimed, str(output), str(temp), digest)
+        real_digest = jobs_module._sha256_file
+
+        def corrupted_final_digest(path):
+            if str(path) == str(output) and output.read_bytes() == b"new subtitle":
+                return "corrupt"
+            return real_digest(path)
+
+        monkeypatch.setattr(jobs_module, "_sha256_file", corrupted_final_digest)
+        with pytest.raises(RuntimeError, match="digest changed"):
+            store.publish_file(claimed, str(temp), str(output), digest)
+
+        assert output.read_bytes() == b"previous valid subtitle"
+        assert not list(tmp_path.glob("*.subgen-backup-*"))
+    finally:
+        store.close()
+
+
+def test_partial_subtitle_backup_failure_does_not_touch_previous_output(tmp_path, monkeypatch):
+    source = tmp_path / "movie.mkv"
+    source.write_bytes(b"video")
+    output = tmp_path / "movie.eng.srt"
+    output.write_bytes(b"previous valid subtitle")
+    temp = tmp_path / "movie.eng.srt.tmp"
+    temp.write_bytes(b"new subtitle")
+    store = DurableJobStore(str(tmp_path / "jobs.sqlite"))
+    try:
+        admitted = store.admit(dict(_task(source), force=True), force=True)
+        claimed = store.claim(admitted.job_id)
+        digest = hashlib.sha256(temp.read_bytes()).hexdigest()
+        assert store.set_publish_intent(claimed, str(output), str(temp), digest)
+
+        def partial_copy(src, dst):
+            with open(dst, "wb") as backup:
+                backup.write(b"partial")
+            raise OSError("simulated network interruption")
+
+        monkeypatch.setattr(jobs_module.shutil, "copy2", partial_copy)
+        with pytest.raises(OSError, match="network interruption"):
+            store.publish_file(claimed, str(temp), str(output), digest)
+
+        assert output.read_bytes() == b"previous valid subtitle"
+        assert not list(tmp_path.glob("*.subgen-backup-*"))
+    finally:
+        store.close()

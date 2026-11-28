@@ -14,9 +14,10 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
 import subgen
 from language_code import LanguageCode
-from subgen_startup_scan.classifier import classify_media
+from subgen_startup_scan.classifier import classify_media, queue_cached_job
 from subgen_startup_scan.classifier import plan_media_record as package_plan_media_record
 from subgen_startup_scan.dependencies import StartupScanDependencies
+from subgen_startup_scan.runtime import startup_scan_deserialize_audio_tracks
 
 
 def _set_db_path(monkeypatch, tmp_path):
@@ -1047,6 +1048,165 @@ def test_classify_media_workload_reports_policy_mismatch_reason():
     assert workload_events[-1]["media_policy_mismatch"] == 1
 
 
+def test_stale_eligible_row_without_tracks_falls_back_to_fresh_plan_and_repairs_cache():
+    path = "/media/movie.mkv"
+    cached = {
+        "path": path,
+        "source_path": path,
+        "size": 4,
+        "mtime": 10,
+        "mtime_ns": 10000,
+        "device": 1,
+        "inode": 2,
+        "policy_signature": "policy-v1",
+        "subtitle_signature": "old-signature",
+        "has_audio": 1,
+        "audio_language": "eng",
+        "subtitle_state": "unknown",
+        "decision": "eligible",
+        "reason": "old-cache-row",
+        "task_type": "transcribe",
+        "transcription_type": "transcribe",
+        "force_language_code": "eng",
+        "audio_tracks_json": "[]",
+        "audio_langs_json": "[]",
+    }
+    queued = []
+    updates = []
+
+    class FakeDB:
+        def get_all_media(self):
+            return [cached]
+
+        def get_all_excluded(self):
+            return []
+
+        def upsert_media(self, **values):
+            updates.append(values)
+
+        def upsert_excluded(self, **values):
+            raise AssertionError("a successful fresh plan must not be cached as excluded")
+
+    class FakeQueue:
+        def put(self, task):
+            queued.append(task)
+            return True
+
+    @contextmanager
+    def benchmark_step(*args, **kwargs):
+        yield
+
+    fresh_tracks = [{"language": LanguageCode.ENGLISH, "default": True}]
+    deps = StartupScanDependencies(
+        startup_scan_force_rewalk=False,
+        startup_scan_classify_workers=1,
+        path_mapping=lambda value: value,
+        current_sidecar_state=lambda rows: "none",
+        compute_subtitle_signature=lambda *args, **kwargs: ("fresh-signature", []),
+        deserialize_audio_tracks=lambda value, *, language_code: [],
+        task_queue=FakeQueue(),
+        language_code=LanguageCode,
+        json_default=subgen.json_default,
+        probe_cache_info=lambda: SimpleNamespace(hits=0, misses=1, currsize=1, maxsize=8192),
+        benchmark_step=benchmark_step,
+        thread_pool_executor_factory=None,
+        startup_scan_planner_trace_logging=False,
+        plan_media_record=lambda media, queue_path, cached_row, inventory, subtitle_rows, sidecar_state: {
+            "media": media,
+            "queue_path": queue_path,
+            "cached_row": cached_row,
+            "current_sidecar_state": sidecar_state,
+            "subtitle_signature": "fresh-signature",
+            "matching_subtitles": [],
+            "plan": {
+                "status": "queue",
+                "reason": "eligible",
+                "task": {
+                    "path": queue_path,
+                    "type": "transcribe",
+                    "transcribe_or_translate": "transcribe",
+                    "force_language": LanguageCode.ENGLISH,
+                    "audio_tracks": fresh_tracks,
+                },
+                "audio_tracks": fresh_tracks,
+                "audio_langs": [LanguageCode.ENGLISH],
+            },
+            "signature_ms": 0.0,
+            "plan_ms": 0.0,
+            "queue_plan_ms": 0.0,
+        },
+    )
+
+    class FakeLogger:
+        def write(self, *args, **kwargs):
+            return None
+
+    result = classify_media(
+        deps,
+        FakeDB(),
+        SimpleNamespace(media_files=[{ "path": path, "size": 4, "mtime": 10, "mtime_ns": 10000, "device": 1, "inode": 2 }]),
+        subtitle_rows_by_media={path: []},
+        benchmark_logger=FakeLogger(),
+        policy_signature="policy-v1",
+    )
+
+    assert result["queued"] == 1
+    assert len(queued) == 1
+    assert updates[-1]["decision"] == "eligible"
+    assert updates[-1]["audio_tracks_json"] != "[]"
+
+
+def test_queue_cached_job_rejects_empty_or_malformed_track_cache():
+    queued = []
+    deps = StartupScanDependencies(
+        task_queue=type("Queue", (), {"is_active": staticmethod(lambda path: False), "put": lambda self, task: queued.append(task)})(),
+        language_code=LanguageCode,
+        deserialize_audio_tracks=lambda value, *, language_code: [],
+    )
+
+    assert queue_cached_job(
+        deps,
+        "/media/movie.mkv",
+        {"decision": "eligible", "audio_tracks_json": "[]"},
+    ) is False
+    assert queued == []
+
+
+def test_queue_cached_job_rejects_tracks_missing_worker_fields_after_real_deserialization():
+    queued = []
+    deps = StartupScanDependencies(
+        task_queue=type("Queue", (), {"is_active": staticmethod(lambda path: False), "put": lambda self, task: queued.append(task)})(),
+        language_code=LanguageCode,
+        deserialize_audio_tracks=startup_scan_deserialize_audio_tracks,
+    )
+
+    assert queue_cached_job(
+        deps,
+        "/media/movie.mkv",
+        {"decision": "eligible", "audio_tracks_json": '[{}, {"language": "eng"}]'},
+    ) is False
+    assert queued == []
+
+
+def test_queue_cached_job_reports_queue_rejection():
+    deps = StartupScanDependencies(
+        task_queue=type("Queue", (), {"is_active": staticmethod(lambda path: False), "put": lambda self, task: False})(),
+        language_code=LanguageCode,
+        deserialize_audio_tracks=lambda value, *, language_code: [{
+            "index": 0,
+            "codec": "aac",
+            "language": LanguageCode.ENGLISH,
+            "default": True,
+        }],
+    )
+
+    assert queue_cached_job(
+        deps,
+        "/media/movie.mkv",
+        {"decision": "eligible", "audio_tracks_json": "valid"},
+    ) is False
+
+
 def test_startup_scan_logs_policy_payload_when_enabled(monkeypatch, tmp_path):
     events = []
 
@@ -1174,7 +1334,13 @@ def test_plan_media_record_keeps_signature_for_queue_paths(monkeypatch):
 def test_plan_media_record_only_reuses_tracks_for_matching_source(changed_field):
     path = "/media/movie.mkv"
     fingerprint = dict(size=20, mtime=30, mtime_ns=30_000_000_000, device=1, inode=2)
-    cached_row = dict(fingerprint, has_audio=True, audio_tracks_json="cached-tracks", policy_signature="old-policy")
+    cached_row = dict(
+        fingerprint,
+        has_audio=True,
+        audio_tracks_json="cached-tracks",
+        policy_signature="old-policy",
+        decision="eligible",
+    )
     media = dict(fingerprint, path=path)
     if changed_field:
         media[changed_field] += 1
@@ -1186,7 +1352,12 @@ def test_plan_media_record_only_reuses_tracks_for_matching_source(changed_field)
         choose_transcribe_language=lambda *args, audio_tracks: audio_tracks[0]["language"],
         describe_skip_reason=lambda *args, **kwargs: (False, "", ""),
         transcribe_or_translate="transcribe",
-        deserialize_audio_tracks=lambda value, **kwargs: [{"language": LanguageCode.ENGLISH}],
+        deserialize_audio_tracks=lambda value, **kwargs: [{
+            "index": 1,
+            "codec": "aac",
+            "language": LanguageCode.ENGLISH,
+            "default": True,
+        }],
         compute_subtitle_signature=lambda *args: ("sig", []),
         get_startup_policy_signature=lambda: "current-policy",
     )
